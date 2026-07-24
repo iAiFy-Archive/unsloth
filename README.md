@@ -55,34 +55,6 @@ Unsloth Studio (Beta) lets you run and train text, [audio](https://unsloth.ai/do
 * **Observability**: Monitor training live, track loss and GPU usage and customize graphs.
 * [Multi-GPU](https://unsloth.ai/docs/basics/multi-gpu-training-with-unsloth) training is supported, with major improvements coming soon.
 
-## 🚀 Unsloth Start
-
-[Unsloth Start](https://unsloth.ai/docs/integrations/unsloth-start) connects [Claude Code](https://unsloth.ai/docs/basics/claude-code), [Codex](https://unsloth.ai/docs/basics/codex) and other agents to local models with one command.
-
-Start Unsloth, load a model, open your project folder, then run:
-
-```bash
-unsloth start claude
-```
-
-Replace `claude` with any supported agent:
-
-| Agent | Command |
-| --- | --- |
-| Claude Code | `unsloth start claude` |
-| OpenAI Codex | `unsloth start codex` |
-| Hermes Agent | `unsloth start hermes` |
-| OpenClaw | `unsloth start openclaw` |
-| OpenCode | `unsloth start opencode` |
-| Pi Coding Agent | `unsloth start pi` |
-
-Claude Code, Codex, OpenCode and Pi can keep their current model and use Unsloth as a local
-subagent:
-
-```bash
-unsloth start claude --as-subagent --model unsloth/model-GGUF:quant
-```
-
 ## 📥 Install
 Unsloth can be used in two ways: through **[Unsloth Studio](https://unsloth.ai/docs/new/studio/)**, the web UI, or through **Unsloth Core**, the code-based version. Each has different requirements.
 
