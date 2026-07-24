@@ -60,6 +60,19 @@ def test_compare_load_clears_stale_native_lease():
     assert "activeNativePathExpiresAtMs: null" in src
 
 
+def test_autoload_records_backend_loaded_model_identity():
+    """An inactive-cache inventory row loads by local path, so startup autoload
+    must key both the active checkpoint and its summary by the backend's loaded
+    model identity instead of the catalog repo id."""
+    src = _read("features/chat/api/chat-adapter.ts")
+    autoload = src.split("async function loadAutoLoadCandidate", 1)[1]
+    autoload = autoload.split("\n  try {", 1)[0]
+    assert "const loadedModelId = loadResp.model || modelPath" in autoload
+    assert "setCheckpoint(loadedModelId," in autoload
+    assert "id: loadedModelId" in autoload
+    assert "m.id === loadedModelId" in autoload
+
+
 def test_rollback_restores_native_lease_expiry_with_token():
     """A failed model switch that rolls back to a previously loaded picked GGUF
     must restore the lease expiry paired with the token, never the token alone
@@ -138,6 +151,19 @@ def test_active_model_config_round_trips_gpu_fields():
     assert "export function gpuFieldsSignature" in shared
 
 
+def test_gpu_picker_round_trips_requested_pool_not_fitted_subset():
+    """A GGUF fit may narrow [0, 1] to [0], but load/status hydration must keep
+    [0, 1] as the editable pool so a later reload can grow back onto GPU 1."""
+    types = _read("features/chat/types/api.ts")
+    assert types.count("requested_gpu_ids?: number[] | null") >= 2
+
+    store = _read("features/chat/stores/chat-runtime-store.ts")
+    assert "resp.requested_gpu_ids ?? resp.gpu_ids ?? null" in store
+
+    status = _read("features/chat/lib/apply-inference-status-to-store.ts")
+    assert "status.requested_gpu_ids ?? status.gpu_ids ?? null" in status
+
+
 def test_compare_load_uses_each_models_gpu_config():
     src = _read("features/chat/shared-composer.tsx")
     assert "ownConfig.gpuMemoryMode ?? compareLoadKnobs.gpuMemoryMode" in src
@@ -189,6 +215,24 @@ def test_local_picker_rows_require_chat_capability():
     memo = re.search(r"const localModels = useMemo\(.*?\[inventory\.localRows\]", src, re.S)
     assert memo, "localModels memo not found"
     assert "row.capabilities.canChat" in memo.group(0)
+
+
+def test_model_picker_toolbar_reflows_before_crossing_picker_edge():
+    """The content-sized section tabs and fixed-width dropdowns must reflow,
+    while an oversized tab group must shrink labels but preserve its icons."""
+    picker = _read("features/model-picker/components/model-selector/pickers.tsx")
+    assert '"flex flex-wrap items-center gap-2"' in picker
+    assert 'hasConnected ? "-mr-4" : "-mr-2"' in picker
+    assert '"flex max-w-full min-w-0 flex-wrap items-center gap-2"' in picker
+
+    tabs = _read("features/model-picker/components/model-selector/pill-tabs.tsx")
+    assert 'fit ? "min-w-0 shrink" : "min-w-0 flex-1"' in tabs
+    assert '<span className="min-w-0 truncate">{tab.label}</span>' in tabs
+
+    selector = _read("features/model-picker/components/model-selector.tsx")
+    assert 'icon={StarIcon} className="size-3.5 shrink-0"' in selector
+    assert 'icon={Download01Icon} className="size-3.5 shrink-0"' in selector
+    assert 'icon={CloudIcon} className="size-3.5 shrink-0"' in selector
 
 
 def test_native_picked_gguf_template_read_through_lease():
@@ -246,6 +290,30 @@ def test_pinned_validation_uses_cached_local_variant_listing():
     delete_fn = delete_fn.split("export ", 1)[0]
     assert "invalidateGgufVariantsCache(" in delete_fn
     assert "bumpInventoryVersion(" in delete_fn
+
+
+def test_chat_autoload_scopes_variant_lookup_to_cached_repo_path():
+    """Autoload must probe the exact cache row it will load, including rows
+    retained from a previously selected Hugging Face cache."""
+    src = _read("features/chat/api/chat-adapter.ts")
+    auto_load = src.split("async function autoLoadSmallestModel", 1)[1]
+    assert auto_load.count("preferLocalCache: true") >= 2
+    assert auto_load.count("localPath: repo.cache_path") >= 2
+
+    chat_api = _read("features/chat/api/chat-api.ts")
+    variants_fn = chat_api.split("export async function listGgufVariants", 1)[1]
+    variants_fn = variants_fn.split("export interface KvCacheEstimate", 1)[0]
+    assert 'params.set("prefer_local_cache", "true")' in variants_fn
+    assert 'params.set("local_path", localPath)' in variants_fn
+
+
+def test_cache_location_update_invalidates_frontend_inventory():
+    """A successful cache switch must refresh both inventory rows and cached
+    GGUF variant results before any stale active-cache identity can be reused."""
+    src = _read("features/settings/api/hugging-face-cache.ts")
+    update_fn = src.split("export async function updateHuggingFaceCacheSettings", 1)[1]
+    assert "bumpInventoryVersion();" in update_fn
+    assert "invalidateGgufVariantsCache();" in update_fn
 
 
 def test_downloaded_list_offsets_virtual_rows():
