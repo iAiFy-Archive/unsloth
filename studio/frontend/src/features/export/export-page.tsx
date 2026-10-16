@@ -319,12 +319,6 @@ export function ExportPage() {
   const hfModelInputRef = useRef("");
   const localModelInputRef = useRef("");
 
-  const hfComboboxAnchorRef = useRef<HTMLDivElement>(null);
-  const localComboboxAnchorRef = useRef<HTMLDivElement>(null);
-  const selectingHfModelRef = useRef(false);
-  const hfModelInputRef = useRef("");
-  const localModelInputRef = useRef("");
-
   const tour = useGuidedTourController({
     id: "export",
     steps: exportTourSteps,
