@@ -12,6 +12,7 @@ import type { ReactElement } from "react";
 import { useEffect, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { ChartsSection } from "./sections/charts-section";
+import { OffloadPanel } from "./sections/offload-panel";
 import { ProgressSection } from "./sections/progress-section";
 import {
   type RunConfigOverride,
@@ -19,9 +20,8 @@ import {
 } from "./sections/run-config-override";
 import { TrainingStartOverlay } from "./training-start-overlay";
 
-/** Retry budget for the run-config lookup. The row is inserted at
- * start_training(), but a lookup issued in the same instant can still miss it;
- * a few short retries cover that without polling a genuinely absent row. */
+/** Retry budget for the run-config lookup. The row is inserted at start_training(), but a
+* lookup issued in the same instant can still miss it; a few short retries cover that. */
 const RUN_CONFIG_FETCH_RETRIES = 5;
 const RUN_CONFIG_FETCH_RETRY_MS = 1000;
 
@@ -44,6 +44,7 @@ export function LiveTrainingView(): ReactElement {
       phase: state.phase,
       message: state.message,
       error: state.error,
+      warnings: state.warnings,
       currentStep: state.currentStep,
       totalSteps: state.totalSteps,
       currentEpoch: state.currentEpoch,
@@ -54,6 +55,7 @@ export function LiveTrainingView(): ReactElement {
       progressPercent: state.progressPercent,
       elapsedSeconds: state.elapsedSeconds,
       etaSeconds: state.etaSeconds,
+      sessionStartStep: state.sessionStartStep,
       evalEnabled: state.evalEnabled,
       outputDir: state.outputDir,
       isTrainingRunning: state.isTrainingRunning,
@@ -73,20 +75,19 @@ export function LiveTrainingView(): ReactElement {
       selectedModel: state.selectedModel,
       projectName: state.projectName,
       trainingMethod: state.trainingMethod,
+      modelType: state.modelType,
     })),
   );
 
-  // Show the ACTIVE run's saved config, not the editable form store the user may
-  // have changed since starting (#6853). start_training() commits the run row
-  // before the pump, so the job id alone gates the fetch; the bounded retry below
-  // covers the narrow uncommitted window, and until it loads ProgressSection falls
-  // back to the form store. The result is keyed by job id and filtered at render.
+  // Show the ACTIVE run's saved config, not the editable form store the user may have changed
+  // since starting (#6853). start_training() commits the run row before the pump, so the job id
+  // alone gates the fetch; the bounded retry below covers the uncommitted window, and until it
+  // loads ProgressSection falls back to the form store.
   const [fetchedRunConfig, setFetchedRunConfig] = useState<{
     jobId: string;
     override: RunConfigOverride | undefined;
   } | null>(null);
-  // Retry budget for the transient 404 below, keyed by job so a new run always
-  // starts with a fresh budget.
+  // Retry budget for the transient 404 below, keyed by job so a new run starts fresh.
   const [fetchAttempt, setFetchAttempt] = useState<{
     jobId: string;
     count: number;
@@ -110,9 +111,8 @@ export function LiveTrainingView(): ReactElement {
         });
       })
       .catch(() => {
-        // A lookup racing the row commit can miss transiently; nothing else in
-        // the deps changes on failure, so retry explicitly. Bounded so a genuinely
-        // absent row falls back to the form store instead of polling forever.
+        // A lookup racing the row commit can miss transiently, and nothing else in the deps changes on
+        // failure, so retry explicitly. Bounded so a genuinely absent row falls back to the form store.
         if (controller.signal.aborted || attempts >= RUN_CONFIG_FETCH_RETRIES) {
           return;
         }
@@ -147,17 +147,20 @@ export function LiveTrainingView(): ReactElement {
     progressPercent: runtime.progressPercent,
     elapsedSeconds: runtime.elapsedSeconds,
     etaSeconds: runtime.etaSeconds,
+    sessionStartStep: runtime.sessionStartStep,
     evalEnabled: runtime.evalEnabled,
     message: runtime.message,
     error: runtime.error,
+    warnings: runtime.warnings,
     isTrainingRunning: runtime.isTrainingRunning,
     modelName: runtime.startModelName ?? config.selectedModel ?? "",
     projectName: activeProjectName,
-    // Prefer the saved run's method: the form may have been edited (e.g. LoRA
-    // -> Full) after the run started, which would relabel the run and hide its
-    // saved LoRA rows in the popover.
+    // Prefer the saved run's method: the form may have been edited (e.g. LoRA -> Full) after the
+    // run started, which would relabel the run and hide its saved LoRA rows in the popover.
     trainingMethod:
       runConfigOverride?.trainingMethod ?? config.trainingMethod ?? "",
+    isDecision:
+      runConfigOverride?.isDecision ?? config.modelType === "decision",
     lossHistory: runtime.lossHistory,
     lrHistory: runtime.lrHistory,
     gradNormHistory: runtime.gradNormHistory,
@@ -178,7 +181,7 @@ export function LiveTrainingView(): ReactElement {
     (isWaitingForFirstStep && runtime.currentStep <= 0);
 
   return (
-    <div className={cn("relative", showOverlay && "min-h-[72vh]")}>
+    <div className={cn("relative", showOverlay && "min-h-[72dvh]")}>
       <div
         className={cn(
           "relative z-10 flex flex-col gap-6 transition-[filter]",
@@ -187,11 +190,13 @@ export function LiveTrainingView(): ReactElement {
       >
         <div data-tour="studio-training-progress">
           <ProgressSection
+            runId={runtime.jobId}
             key={runtime.jobId ?? "no-job"}
             data={viewData}
             configOverride={runConfigOverride}
           />
         </div>
+        <OffloadPanel isTrainingRunning={viewData.isTrainingRunning} />
         <ChartsSection
           currentStep={viewData.currentStep}
           totalSteps={viewData.totalSteps}

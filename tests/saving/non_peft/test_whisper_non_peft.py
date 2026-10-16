@@ -1,3 +1,15 @@
+# tests/saving scripts run their whole body at import, so skip collection unless opted in.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
+from tests.utils.os_utils import require_opt_in as _require_opt_in
+
+_require_opt_in(
+    "UNSLOTH_RUN_SAVING_SCRIPTS",
+    "GPU + Hub saving script; its body runs at import.",
+)
+
 from unsloth import FastLanguageModel, FastModel
 from transformers import AutoModelForCausalLM, WhisperForConditionalGeneration
 from peft import PeftModel
@@ -17,12 +29,11 @@ print(f"{'='*80}")
 
 model, tokenizer = FastModel.from_pretrained(
     model_name = "unsloth/whisper-large-v3",
-    dtype = None,  # Leave as None for auto detection
-    load_in_4bit = False,  # Set to True to do 4bit quantization which reduces memory
+    dtype = None,
+    load_in_4bit = False,
     auto_model = WhisperForConditionalGeneration,
     whisper_language = "English",
     whisper_task = "transcribe",
-    # token = "hf_...", # use one if using gated models like meta-llama/Llama-2-7b-hf
 )
 
 print("✅ Base model loaded successfully!")
@@ -52,7 +63,7 @@ print(f"{'='*80}")
 
 try:
     with warnings.catch_warnings():
-        warnings.simplefilter("error")  # any warning -> failure
+        warnings.simplefilter("error")
         model.save_pretrained("test_output")
         print("✅ Standard save_pretrained completed successfully!")
 except Exception as e:

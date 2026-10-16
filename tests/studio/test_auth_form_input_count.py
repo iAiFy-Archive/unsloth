@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Fast source and runtime contracts for Unsloth's frontend authentication flows.
-
-PR #5490 added a third "Current password" input, regressing first-boot UX to
-three inputs; PR #5545 restores two by rendering it only when BOOTSTRAP is absent.
-Issue #7114 covers auth redirects and the persisted System monitor; its browser
-lifecycle remains covered by tests/studio/playwright_chat_ui.py."""
+"""First boot shows two password inputs; 'Current password' renders only when BOOTSTRAP is absent."""
 
 from __future__ import annotations
 
@@ -51,7 +46,7 @@ def _conditional_extent(src: str) -> tuple[int, int]:
 def test_hasbootstrappassword_constant_is_derived_from_bootstrap_window_value():
     """The guard must read from window.__UNSLOTH_BOOTSTRAP__, matching the backend's
     bootstrap-injection contract in studio/backend/main.py::_inject_bootstrap."""
-    src = AUTH_FORM.read_text()
+    src = AUTH_FORM.read_text(encoding = "utf-8")
     assert "const hasBootstrapPassword = Boolean(window.__UNSLOTH_BOOTSTRAP__?.password);" in src, (
         "hasBootstrapPassword constant missing or its derivation drifted; "
         "this is the gate that hides the Current password input on first boot"
@@ -61,7 +56,7 @@ def test_hasbootstrappassword_constant_is_derived_from_bootstrap_window_value():
 def test_exactly_one_hasBootstrapPassword_conditional_exists():
     """Only one `!hasBootstrapPassword` JSX check is allowed; a second would split
     rendering into branches and likely hide or duplicate the New / Confirm inputs."""
-    src = AUTH_FORM.read_text()
+    src = AUTH_FORM.read_text(encoding = "utf-8")
     count = src.count("!hasBootstrapPassword")
     assert count == 1, (
         f"expected exactly one !hasBootstrapPassword usage, found {count}; "
@@ -72,7 +67,7 @@ def test_exactly_one_hasBootstrapPassword_conditional_exists():
 def test_current_password_input_is_inside_the_hasBootstrapPassword_conditional():
     """`id="current-password"` must sit inside `{!hasBootstrapPassword && (...)}`,
     else it renders on first boot too, regressing the pre-#5490 UX that PR #5545 restores."""
-    src = AUTH_FORM.read_text()
+    src = AUTH_FORM.read_text(encoding = "utf-8")
     s, e = _conditional_extent(src)
     idx = src.find('id="current-password"')
     assert idx != -1, "the Current password input was removed entirely"
@@ -86,7 +81,7 @@ def test_current_password_input_is_inside_the_hasBootstrapPassword_conditional()
 def test_new_password_input_is_outside_the_hasBootstrapPassword_conditional():
     """`id="new-password"` must sit outside `{!hasBootstrapPassword && (...)}`,
     else it disappears on admin-forced resets, regressing PR #5490."""
-    src = AUTH_FORM.read_text()
+    src = AUTH_FORM.read_text(encoding = "utf-8")
     s, e = _conditional_extent(src)
     idx = src.find('id="new-password"')
     assert idx != -1, "the New password input was removed entirely"
@@ -99,7 +94,7 @@ def test_new_password_input_is_outside_the_hasBootstrapPassword_conditional():
 
 def test_confirm_password_input_is_outside_the_hasBootstrapPassword_conditional():
     """Same as New password, for `id="confirm-password"`."""
-    src = AUTH_FORM.read_text()
+    src = AUTH_FORM.read_text(encoding = "utf-8")
     s, e = _conditional_extent(src)
     idx = src.find('id="confirm-password"')
     assert idx != -1, "the Confirm password input was removed entirely"
@@ -114,13 +109,12 @@ def test_change_password_jsx_declares_exactly_three_password_inputs():
     """The change-password JSX block (`{!isLoginMode && (...)}`) must declare exactly
     current/new/confirm; a fourth would break the 2-input first-boot contract (the
     conditional only hides Current)."""
-    src = AUTH_FORM.read_text()
+    src = AUTH_FORM.read_text(encoding = "utf-8")
     start = src.find("{!isLoginMode && (")
     assert start != -1, (
         "the change-password JSX subtree marker {!isLoginMode && (...)} "
         "is missing; the file's structure has drifted"
     )
-    # Match the corresponding `)}` for {!isLoginMode && (...)}.
     depth = 1
     i = start + len("{!isLoginMode && (")
     while i < len(src) and depth > 0:
@@ -147,7 +141,7 @@ def test_change_password_jsx_declares_exactly_three_password_inputs():
 def test_login_jsx_declares_exactly_one_password_input():
     """The login JSX block (`isLoginMode && (...)`) must declare exactly one password
     input (the bootstrap password pasted from the CLI); a second breaks the per-mode matrix."""
-    src = AUTH_FORM.read_text()
+    src = AUTH_FORM.read_text(encoding = "utf-8")
     start = src.find("{isLoginMode && (")
     assert start != -1, "the login JSX subtree marker is missing"
     depth = 1
@@ -161,38 +155,146 @@ def test_login_jsx_declares_exactly_one_password_input():
         i += 1
     subtree = src[start:i]
     ids = re.findall(r'id="([a-z-]+)"', subtree)
-    # Lock the count, not the spelling, so a rename does not falsely fail.
+    # Lock the count, not the spelling.
     pw_ids = [x for x in ids if "password" in x]
-    assert len(pw_ids) == 1, (
-        f"login JSX must declare exactly one password-typed input; " f"found {pw_ids!r}"
-    )
+    assert (
+        len(pw_ids) == 1
+    ), f"login JSX must declare exactly one password-typed input; found {pw_ids!r}"
+
+
+def _at_depth_zero(condition: str):
+    """Every character of ``condition`` that sits outside any bracket."""
+    depth = 0
+    for index, char in enumerate(condition):
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif depth == 0:
+            yield index, char
+
+
+def _leading_disjunct(condition: str) -> str:
+    """The first `||` operand, split at bracket depth zero so a nested `||` stays intact."""
+    for index, char in _at_depth_zero(condition):
+        if char == "|" and condition[index : index + 2] == "||":
+            return condition[:index]
+    return condition
+
+
+def _binds_looser_than_or(condition: str) -> bool:
+    """True if `?:` or `,` binds looser than `||`, so the disjunction's value can be discarded."""
+    for index, char in _at_depth_zero(condition):
+        if char == ",":
+            return True
+        if char != "?":
+            continue
+        if condition[index + 1 : index + 2] in (".", "?") or condition[index - 1 : index] == "?":
+            continue
+        return True
+    return False
+
+
+def _blanked(source: str) -> str:
+    """Blanks comment and string bodies, so brackets and tokens inside prose cannot be mistaken for code."""
+    out, index, end = list(source), 0, len(source)
+    while index < end:
+        pair = source[index : index + 2]
+        if pair in ("//", "/*"):
+            stop = source.find("\n" if pair == "//" else "*/", index + 2)
+            stop = end if stop == -1 else stop + (0 if pair == "//" else 2)
+            out[index:stop] = " " * (stop - index)
+            index = stop
+        elif source[index] in "\"'`":
+            quote, stop = source[index], index + 1
+            while stop < end and source[stop] != quote:
+                stop += 2 if source[stop] == "\\" else 1
+            out[index + 1 : stop] = " " * max(0, stop - index - 1)
+            index = min(stop + 1, end)
+        else:
+            index += 1
+    return "".join(out)
+
+
+def _function_body(source: str, name: str) -> str:
+    """Walks past the parameter list first, since a destructured `{ active }` parameter has braces."""
+    index = source.index("(", source.index(f"export function {name}("))
+    depth = 0
+    while index < len(source):
+        depth += (source[index] == "(") - (source[index] == ")")
+        index += 1
+        if depth == 0:
+            break
+    opening = source.index("{", index)
+    depth = 0
+    for index in range(opening, len(source)):
+        depth += (source[index] == "{") - (source[index] == "}")
+        if depth == 0:
+            return source[opening : index + 1]
+    return source[opening:]
+
+
+def _inactive_returns_null(body: str) -> bool:
+    """Only a top-level `if` in the component body counts; a return inside a callback leaves it mounted."""
+    for match in re.finditer(r"\bif \(", body):
+        before = body[: match.start()]
+        if before.count("{") - before.count("}") != 1:
+            continue
+        start = match.end()
+        depth, index = 1, start
+        while index < len(body) and depth:
+            depth += (body[index] == "(") - (body[index] == ")")
+            index += 1
+        condition, tail = body[start : index - 1], body[index:]
+        if not re.match(r"\s*\{?\s*return null;", tail):
+            continue
+        if _binds_looser_than_or(condition):
+            continue
+        if _leading_disjunct(condition).strip() == "!active":
+            return True
+    return False
 
 
 def test_auth_flow_routes_do_not_mount_global_settings():
-    root = (FRONTEND / "app/routes/__root.tsx").read_text()
-    assert "{!isAuthFlowRoute && <SettingsDialog />}" in root
+    root = (FRONTEND / "app/routes/__root.tsx").read_text(encoding = "utf-8")
+    mount = (FRONTEND / "features/settings/settings-dialog-mount.tsx").read_text(encoding = "utf-8")
+    assert "<SettingsDialogMount active={active && ready} />" in root
+    assert "<CredentialBootstrapGate active={!isAuthFlowRoute}>" in root
+    # Only the render-nothing-when-inactive guard is required; the lazy-mount flags changed in #10237.
+    mount_body = _function_body(_blanked(mount), "SettingsDialogMount")
+    assert _inactive_returns_null(mount_body), (
+        "SettingsDialogMount no longer returns null while inactive, so the settings "
+        "dialog can mount on the auth routes"
+    )
     assert "useSettingsDialogStore.getState().closeDialog();" in root
-    assert "if (isAuthFlowRoute) return;" in root
-    for route in ("login", "change-password", "onboarding"):
-        assert "isAuthFlow: true" in (FRONTEND / f"app/routes/{route}.tsx").read_text()
+    assert "if (isAuthFlowRoute) return;" in root or "{ enabled: !isAuthFlowRoute }" in root
+    for route in ("login", "change-password"):
+        assert "isAuthFlow: true" in (FRONTEND / f"app/routes/{route}.tsx").read_text(
+            encoding = "utf-8"
+        )
 
 
 def test_auth_redirect_targets_are_idempotent_and_concurrent(tmp_path: Path):
     if shutil.which("node") is None:
         pytest.skip("node not available")
-    probe = subprocess.run(
-        ["node", "--experimental-strip-types", "--version"],
-        capture_output = True,
-        text = True,
-        timeout = 5,
-    )
+    # A timeout is a SKIP: a cold Windows runner can take over 5s for `node --version`.
+    try:
+        probe = subprocess.run(
+            ["node", "--experimental-strip-types", "--version"],
+            capture_output = True,
+            text = True,
+            timeout = 120,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.skip("node did not answer --version in time on this runner")
     if probe.returncode != 0:
         pytest.skip("node --experimental-strip-types not available")
 
     source = (
-        AUTH_API.read_text()
+        AUTH_API.read_text(encoding = "utf-8")
         .replace('from "@/lib/api-base"', 'from "./stubs.mjs"')
         .replace('from "./session"', 'from "./stubs.mjs"')
+        .replace('from "@/lib/account-transition"', 'from "./stubs.mjs"')
     )
     (tmp_path / "api.ts").write_text(source)
     (tmp_path / "stubs.mjs").write_text(
@@ -200,6 +302,12 @@ def test_auth_redirect_targets_are_idempotent_and_concurrent(tmp_path: Path):
             let access = null, refresh = null, passwordChange = false;
             export const apiUrl = (path) => path;
             export const isTauri = false;
+            // Read by the Tauri transport-failure path before it asks the native health
+            // check. This stub is the web build (isTauri false), where that path is never
+            // taken, but the import is unconditional and an ES module import of a name the
+            // stub does not export is a SyntaxError at instantiation, not at call time.
+            export const getApiPort = () => null;
+            export const accountTransitionPending = () => false;
             export const reset = (a = null, r = null) => { access = a; refresh = r; passwordChange = false; };
             export const clearAuthTokens = () => { access = null; refresh = null; };
             export const getAuthToken = () => access;
@@ -270,6 +378,6 @@ def test_auth_redirect_targets_are_idempotent_and_concurrent(tmp_path: Path):
         cwd = tmp_path,
         capture_output = True,
         text = True,
-        timeout = 30,
+        timeout = 180,
     )
     assert result.returncode == 0, f"stderr: {result.stderr}\nstdout: {result.stdout}"

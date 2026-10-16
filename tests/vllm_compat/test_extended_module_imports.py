@@ -1,13 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team.
-"""Extended import-smoke + API surface checks for unsloth + unsloth-zoo
-modules under the CUDA spoof harness.
-
-Walks the full set of modules the public surface depends on (vs the 5 in
-test_unsloth_zoo_imports.py), catching import-time symbol drift, spoof-
-flipped gates (e.g. _IS_MLX on a non-Mac box), and FastModel API drift.
-CPU-only; inherits the _zoo_aggressive_cuda_spoof harness.
-"""
+"""CPU-only import and API checks under the CUDA spoof harness, catching spoof-flipped gates."""
 
 from __future__ import annotations
 
@@ -31,7 +24,6 @@ import _zoo_aggressive_cuda_spoof as _spoof  # noqa: E402
 _spoof.apply()
 
 
-# Stub optional deps absent on a CPU-only runner (mirrors test_unsloth_zoo_imports.py).
 def _stub_module(name: str, attrs: dict | None = None) -> None:
     """Stub a missing optional dep, with __spec__ set so find_spec() doesn't
     raise `ValueError: __spec__ is None` for torch/transformers/torchcodec callers."""
@@ -83,9 +75,6 @@ def _has_unsloth() -> bool:
     return importlib.util.find_spec("unsloth") is not None
 
 
-# unsloth-zoo modules with no top-level vllm/CUDA import: must load cleanly under spoof.
-
-
 _ZOO_VLLM_FREE_MODULES = [
     "unsloth_zoo.compiler",
     "unsloth_zoo.compiler_replacements",
@@ -114,7 +103,6 @@ _ZOO_VLLM_FREE_MODULES = [
 @pytest.mark.parametrize("modname", _ZOO_VLLM_FREE_MODULES)
 def test_unsloth_zoo_module_imports_under_spoof(modname: str):
     """Each unsloth_zoo module imports cleanly under spoof (catches import-time symbol drift)."""
-    # Drop stale partial-import state from a prior failure.
     sys.modules.pop(modname, None)
     try:
         importlib.import_module(modname)
@@ -122,9 +110,6 @@ def test_unsloth_zoo_module_imports_under_spoof(modname: str):
         pytest.fail(
             f"{modname} failed to import under CUDA spoof: " f"{type(e).__name__}: {str(e)[:300]}"
         )
-
-
-# Spoof correctness: _IS_MLX stays False on a non-Mac runner.
 
 
 @pytest.mark.skipif(not _has_unsloth(), reason = "unsloth not installed")
@@ -137,9 +122,6 @@ def test_unsloth_is_mlx_false_under_spoof():
         f"_IS_MLX activated on a non-Apple-Silicon runner under CUDA spoof; "
         f"the MLX gate logic in unsloth/__init__.py is too lax"
     )
-
-
-# unsloth.models.* — core surfaces loaded transitively by `from unsloth import FastLanguageModel`.
 
 
 _UNSLOTH_CORE_MODULES = [
@@ -165,18 +147,11 @@ def test_unsloth_core_module_imports_under_spoof(modname: str):
     sys.modules.pop(modname, None)
     try:
         importlib.import_module(modname)
-    except OSError as e:
-        # "could not get source code": editable-install + frozen sub-import
-        # quirk, not symbol drift. Skip rather than false-fail.
-        pytest.skip(f"{modname} env issue: {e!s}")
     except Exception as e:
+        # Do not skip OSError: a second import of unsloth.models._utils used to fail this way (real bug).
         pytest.fail(
             f"{modname} failed to import under CUDA spoof: " f"{type(e).__name__}: {str(e)[:300]}"
         )
-
-
-# FastLanguageModel/FastVisionModel/FastModel surface must be non-empty
-# with the notebook-relied methods present.
 
 
 @pytest.mark.skipif(not _has_unsloth(), reason = "unsloth not installed")
@@ -191,7 +166,6 @@ def test_fast_model_class_surface_under_spoof():
             continue
         found_at_least_one = True
         public = sorted(n for n in dir(cls) if not n.startswith("_"))
-        # Notebooks rely on these methods.
         for method in ("from_pretrained", "get_peft_model"):
             assert method in public, (
                 f"unsloth.{cls_name}.{method} missing under spoof; "
@@ -203,10 +177,6 @@ def test_fast_model_class_surface_under_spoof():
     )
 
 
-# RL surface: GRPO/SFT/DPO dispatch table must be populated, not silently
-# empty while rl_replacements imports cleanly.
-
-
 @pytest.mark.skipif(not _has_unsloth(), reason = "unsloth not installed")
 def test_unsloth_rl_replacements_dispatch_populated():
     try:
@@ -214,15 +184,11 @@ def test_unsloth_rl_replacements_dispatch_populated():
     except Exception as e:
         pytest.skip(f"`import unsloth` failed under spoof: {e}")
     sys.modules.pop("unsloth.models.rl_replacements", None)
-    try:
-        rl = importlib.import_module("unsloth.models.rl_replacements")
-    except OSError as e:
-        pytest.skip(f"env issue importing rl_replacements: {e!s}")
+    rl = importlib.import_module("unsloth.models.rl_replacements")
     funcs = getattr(rl, "RL_FUNCTIONS", None)
     if funcs is None:
         pytest.skip("RL_FUNCTIONS attribute not present (architecture changed; check)")
     assert isinstance(funcs, dict), f"RL_FUNCTIONS expected dict, got {type(funcs).__name__}"
-    # Trainer types unsloth-zoo dispatches against must be keys.
     for key in ("grpo_trainer", "sft_trainer", "dpo_trainer"):
         assert key in funcs, (
             f"RL_FUNCTIONS missing dispatch key '{key}'; "
@@ -231,9 +197,6 @@ def test_unsloth_rl_replacements_dispatch_populated():
         assert (
             isinstance(funcs[key], list) and len(funcs[key]) > 0
         ), f"RL_FUNCTIONS[{key!r}] is empty list; rewrites no-op"
-
-
-# unsloth-zoo compiler test_apply_fused_lm_head (compiler.py:1983) must be callable.
 
 
 @pytest.mark.skipif(not _has_unsloth_zoo(), reason = "unsloth_zoo not installed")
@@ -245,9 +208,6 @@ def test_zoo_compiler_apply_fused_lm_head_callable():
         f"unsloth_zoo.compiler.test_apply_fused_lm_head missing or non-callable; "
         f"the in-file CPU regression test is the only fused-LM-head coverage"
     )
-
-
-# FastModel.from_pretrained kwarg stability: removal becomes silent positional drift.
 
 
 @pytest.mark.skipif(not _has_unsloth(), reason = "unsloth not installed")
@@ -265,7 +225,6 @@ def test_fast_model_from_pretrained_kwargs_under_spoof():
         params = list(inspect.signature(fn).parameters)
     except (TypeError, ValueError):
         pytest.skip("from_pretrained signature not introspectable")
-    # Notebooks use these kwargs by name everywhere.
     for kwarg in ("model_name", "max_seq_length", "load_in_4bit"):
         assert kwarg in params, (
             f"FastLanguageModel.from_pretrained missing kwarg `{kwarg}`; "

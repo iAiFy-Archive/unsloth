@@ -13,22 +13,33 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 from unsloth_cli.commands.start import (
     _CLAUDE_ENV_UNSET,
+    _CLAUDE_SUBAGENT_AUTO_ROUTE_ENV,
+    _CLAUDE_SUBAGENT_FALLBACK_ENV,
+    _CLAUDE_SUBAGENT_SETTINGS_ENV,
+    _SUBAGENT_AUTO_ROUTE_DESCRIPTION,
+    _SUBAGENT_AUTO_ROUTE_INSTRUCTIONS,
     _SUBAGENT_DESCRIPTION,
     _SUBAGENT_INSTRUCTIONS,
     _SUBAGENT_PLAN_DESCRIPTION,
     _SUBAGENT_PLAN_INSTRUCTIONS,
+    _agent_config_path,
     _claude_flags,
     _claude_local_env,
+    _prefer_windows_cmd_sibling,
+    _resolved_launch_command,
     _wsl_shim_env,
 )
 
 _MAX_RESULT_CHARACTERS = 100_000
 _CANCEL_POLL_SECONDS = 0.1
 _CANCEL_GRACE_SECONDS = 2.0
+# A server that accepts and never answers would block the child and the parent forever; 0 restores the unbounded wait.
+_DEFAULT_TIMEOUT_SECONDS = 1800.0
 
 
 def _required_env(name: str) -> str:
@@ -38,16 +49,27 @@ def _required_env(name: str) -> str:
     return value
 
 
+def _timeout_seconds() -> float:
+    """Wall-clock cap on one child run; 0 or unparsable means wait forever."""
+    raw = os.environ.get("UNSLOTH_CLAUDE_SUBAGENT_TIMEOUT")
+    if raw is None or not raw.strip():
+        return _DEFAULT_TIMEOUT_SECONDS
+    try:
+        parsed = float(raw.strip())
+    except ValueError:
+        return _DEFAULT_TIMEOUT_SECONDS
+    return parsed if parsed > 0 else 0.0
+
+
 def _bounded(text: str) -> str:
     if len(text) <= _MAX_RESULT_CHARACTERS:
         return text
     return text[:_MAX_RESULT_CHARACTERS] + "\n\n[Local agent output truncated]"
 
 
-def _result_text(stdout: str) -> str:
+def _result_payload(stdout: str) -> dict:
     lines = [line for line in stdout.splitlines() if line.strip()]
-    candidates = [stdout.strip(), *reversed(lines)]
-    for candidate in candidates:
+    for candidate in [stdout.strip(), *reversed(lines)]:
         try:
             payload = json.loads(candidate)
         except ValueError:
@@ -55,10 +77,18 @@ def _result_text(stdout: str) -> str:
         if not isinstance(payload, dict):
             continue
         result = payload.get("result")
-        if payload.get("is_error"):
-            raise RuntimeError(str(result or "The local Claude agent failed."))
-        if isinstance(result, str) and result.strip():
-            return _bounded(result.strip())
+        if payload.get("is_error") or (isinstance(result, str) and result.strip()):
+            return payload
+    return {}
+
+
+def _result_text(stdout: str) -> str:
+    payload = _result_payload(stdout)
+    result = payload.get("result")
+    if payload.get("is_error"):
+        raise RuntimeError(str(result or "The local Claude agent failed."))
+    if isinstance(result, str) and result.strip():
+        return _bounded(result.strip())
     raise RuntimeError("The local Claude agent returned no readable result.")
 
 
@@ -66,7 +96,6 @@ def _stop_child(process: subprocess.Popen) -> None:
     """Stop the Claude child and any tool processes it started."""
     if process.poll() is not None:
         if os.name != "nt":
-            # Leader exited, but its tool processes may still be running.
             try:
                 os.killpg(process.pid, signal.SIGTERM)
             except OSError:
@@ -108,7 +137,6 @@ def _stop_child(process: subprocess.Popen) -> None:
         process.wait()
     else:
         if os.name != "nt":
-            # Leader is gone; kill any surviving group members.
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except OSError:
@@ -127,8 +155,10 @@ def run_local_agent(
     entry = {"id": model, "context_length": window}
     local_env = _claude_local_env(base, key, entry)
     child_env = dict(os.environ)
+    settings = os.environ.get(_CLAUDE_SUBAGENT_SETTINGS_ENV)
+    settings = _agent_config_path(Path(settings), ["claude"]) if settings else None
 
-    executable = shutil.which("claude")
+    executable = _prefer_windows_cmd_sibling(shutil.which("claude"))
     if executable is None:
         raise RuntimeError("`claude` is not installed or is not on PATH.")
     cancel_event = cancel_event or threading.Event()
@@ -138,7 +168,7 @@ def run_local_agent(
         "claude",
         "--model",
         model,
-        *_claude_flags(model),
+        *_claude_flags(model, settings),
         "--permission-mode",
         (
             "plan"
@@ -153,6 +183,11 @@ def run_local_agent(
         "--output-format",
         "json",
         "--no-session-persistence",
+        # The full tool set (~16k tokens) fills a small window; plan mode is no write barrier, so read-only gets no writer.
+        "--tools",
+        "Read,Grep,Glob,ExitPlanMode"
+        if read_only
+        else "Bash,Read,Edit,Write,Grep,Glob,NotebookEdit",
         "--append-system-prompt",
         _SUBAGENT_PLAN_INSTRUCTIONS if read_only else _SUBAGENT_INSTRUCTIONS,
         f"Task: {task}",
@@ -176,15 +211,20 @@ def run_local_agent(
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
     }
     if os.name == "nt":
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         popen_kwargs["start_new_session"] = True
+    # Same CR/LF hazard as the Codex bridge: resolve npm shims rather than spawning the .cmd raw.
     process = subprocess.Popen(
-        [executable, *command[1:]],
+        _resolved_launch_command(executable, command[1:], child_env),
         **popen_kwargs,
     )
+    deadline = _timeout_seconds()
+    started_at = time.monotonic()
     try:
         while True:
             try:
@@ -194,12 +234,21 @@ def run_local_agent(
                 if cancel_event.is_set():
                     _stop_child(process)
                     raise RuntimeError("The local Claude agent was cancelled.")
+                waited = time.monotonic() - started_at
+                if deadline and waited > deadline:
+                    _stop_child(process)
+                    raise RuntimeError(
+                        f"The local Claude agent produced nothing after {waited:.0f}s. "
+                        "The local server is likely wedged; check that a model is loaded."
+                    )
     except BaseException:
         if process.poll() is None:
             _stop_child(process)
         raise
     if process.returncode != 0:
-        detail = stderr.strip() or stdout.strip()
+        # stderr can hold only claude's own warnings; the result says why the run stopped.
+        reason = _result_payload(stdout).get("result")
+        detail = str(reason or "").strip() or stderr.strip() or stdout.strip()
         raise RuntimeError(
             _bounded(detail) or f"Local Claude exited with code {process.returncode}."
         )
@@ -321,8 +370,8 @@ def serve(
             cancel_event.set()
 
     def handle_shutdown(_signum: int, _frame: Any) -> None:
-        # Claude Code sends SIGINT (possibly repeatedly) to cancel a tool call. Only
-        # the first unwinds stdin; later ones must not interrupt process-tree cleanup.
+        # Claude Code may send SIGINT repeatedly; only the first unwinds stdin, later ones must not
+        # interrupt process-tree cleanup.
         first_signal = not shutdown_started.is_set()
         shutdown_started.set()
         cancel_active()
@@ -420,12 +469,43 @@ def serve(
             signal.signal(signum, handler)
 
 
+def _with_fallback(run_agent: Callable[..., str], marker: str) -> Callable[..., str]:
+    def run(task: str, cancel_event: threading.Event) -> str:
+        try:
+            text = run_agent(task, cancel_event)
+        except Exception as exc:
+            if cancel_event.is_set():
+                raise
+            Path(marker).touch()
+            raise RuntimeError(
+                f"{exc}\n\nThe local agent failed, so your own Read, Grep, Glob, Bash, "
+                "PowerShell, Monitor, NotebookRead and Agent tools are unblocked until the "
+                "next successful unsloth_agent call. "
+                "Do this step yourself."
+            ) from exc
+        Path(marker).unlink(missing_ok = True)
+        return text
+
+    return run
+
+
 def main() -> None:
+    auto_route = os.environ.get(_CLAUDE_SUBAGENT_AUTO_ROUTE_ENV) == "1"
+    marker = os.environ.get(_CLAUDE_SUBAGENT_FALLBACK_ENV)
+    run_agent = run_local_agent
+    run_read_only_agent = lambda task, cancel_event: run_local_agent(
+        task, cancel_event, read_only = True
+    )
+    if marker:
+        # With --auto-route the parent's own tools are blocked, so a failed local run would otherwise lose the task.
+        run_agent = _with_fallback(run_agent, marker)
+        run_read_only_agent = _with_fallback(run_read_only_agent, marker)
     serve(
-        run_read_only_agent = lambda task, cancel_event: run_local_agent(
-            task, cancel_event, read_only = True
-        ),
+        run_agent = run_agent,
+        tool_description = _SUBAGENT_AUTO_ROUTE_DESCRIPTION if auto_route else None,
+        run_read_only_agent = run_read_only_agent,
         read_only_tool_name = "unsloth_plan_agent",
+        instructions = _SUBAGENT_AUTO_ROUTE_INSTRUCTIONS if auto_route else None,
     )
 
 

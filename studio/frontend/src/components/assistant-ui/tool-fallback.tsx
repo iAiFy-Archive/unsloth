@@ -9,20 +9,44 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import { Spinner } from "@/components/ui/spinner";
+// eslint-disable-next-line no-restricted-imports -- the feature barrel imports this component
+import { useChatPreferencesStore } from "@/features/chat/stores/chat-preferences-store";
+import { useDetachThreadFromBottom } from "@/components/assistant-ui/use-intent-aware-autoscroll";
 import { useCollapseScrollLock } from "@/hooks/use-collapse-scroll-lock";
+import {
+  formatMcpToolName,
+  mcpServerFromProvenance,
+  mcpToolFromProvenance,
+  splitMcpToolName,
+} from "@/features/chat/utils/mcp-tool-name";
+import { McpAppFrame } from "@/features/chat/mcp-apps/mcp-app-frame";
+import {
+  type McpUiToolResult,
+  isMcpUiToolResult,
+} from "@/features/chat/mcp-apps/mcp-ui";
+import {
+  SANDBOX_FILE_TOOLS,
+  type SandboxFile,
+  isSandboxToolResult,
+  sandboxSessionIdFor,
+} from "@/components/assistant-ui/sandbox-files";
+import { SandboxFiles } from "@/components/assistant-ui/sandbox-files-view";
+import { useChatProjectScope } from "@/features/chat/chat-project-scope";
+import { stripAnsi, stringifyToolResult } from "@/lib/strip-ansi";
 import { cn } from "@/lib/utils";
 import {
   type ToolCallMessagePartComponent,
   type ToolCallMessagePartStatus,
+  useAuiState,
 } from "@assistant-ui/react";
 import {
   AlertCircleIcon,
   ChevronDownIcon,
   LoaderIcon,
+  WrenchIcon,
   XCircleIcon,
 } from "lucide-react";
-import { Tick02Icon } from "@/lib/tick-icon";
-import { HugeiconsIcon } from "@hugeicons/react";
+import { InternetGlyph } from "@/lib/internet-icon";
 import {
   type CSSProperties,
   type ComponentProps,
@@ -32,6 +56,16 @@ import {
   useRef,
   useState,
 } from "react";
+import {
+  isToolCallCancelled,
+  isToolCallRunning,
+  toolArgText,
+  toolFallbackLabel,
+} from "./tool-arg-text";
+import {
+  syncToolActivityPreference,
+  toolActivityOpen,
+} from "./tool-activity-open-state";
 
 const ANIMATION_DURATION = 200;
 
@@ -42,6 +76,12 @@ export type ToolFallbackRootProps = Omit<
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
   defaultOpen?: boolean;
+  /**
+   * Parked on an allow/deny decision. Pins the card open above `open` and the
+   * collapse preference, so what is being approved stays readable. Groups do
+   * the same with `hasPendingConfirmation`.
+   */
+  awaitingApproval?: boolean;
 };
 
 function ToolFallbackRoot({
@@ -49,27 +89,57 @@ function ToolFallbackRoot({
   open: controlledOpen,
   onOpenChange: controlledOnOpenChange,
   defaultOpen = false,
+  awaitingApproval = false,
   children,
   ...props
 }: ToolFallbackRootProps) {
   const collapsibleRef = useRef<HTMLDivElement>(null);
-  const [uncontrolledOpen, setUncontrolledOpen] = useState(defaultOpen);
+  const visibility = useChatPreferencesStore((state) => state.toolVisibility);
+  const [uncontrolledState, setUncontrolledState] = useState(() => ({
+    visibility,
+    active: defaultOpen,
+    override: null as boolean | null,
+  }));
+  const syncedUncontrolledState = syncToolActivityPreference(
+    uncontrolledState,
+    visibility,
+    defaultOpen,
+  );
+  if (syncedUncontrolledState !== uncontrolledState) {
+    setUncontrolledState(syncedUncontrolledState);
+  }
   const lockScroll = useCollapseScrollLock(collapsibleRef, ANIMATION_DURATION);
 
   const isControlled = controlledOpen !== undefined;
-  const isOpen = isControlled ? controlledOpen : uncontrolledOpen;
+  const isOpen =
+    awaitingApproval ||
+    (isControlled ? controlledOpen : toolActivityOpen(syncedUncontrolledState));
 
+  // Opening by hand grows the card downward; see the same note in reasoning.tsx.
+  const detachFromBottom = useDetachThreadFromBottom();
+  const messageRunning = useAuiState(
+    ({ message }) => message.status?.type === "running",
+  );
   const handleOpenChange = useCallback(
     (open: boolean) => {
       if (!open) {
         lockScroll();
+      } else if (!messageRunning) {
+        detachFromBottom();
       }
       if (!isControlled) {
-        setUncontrolledOpen(open);
+        setUncontrolledState({ ...syncedUncontrolledState, override: open });
       }
       controlledOnOpenChange?.(open);
     },
-    [lockScroll, isControlled, controlledOnOpenChange],
+    [
+      syncedUncontrolledState,
+      lockScroll,
+      isControlled,
+      controlledOnOpenChange,
+      detachFromBottom,
+      messageRunning,
+    ],
   );
 
   return (
@@ -79,7 +149,7 @@ function ToolFallbackRoot({
       open={isOpen}
       onOpenChange={handleOpenChange}
       className={cn(
-        "aui-tool-fallback-root group/tool-fallback-root w-full py-1",
+        "aui-tool-fallback-root group/tool-fallback-root w-full",
         className,
       )}
       style={
@@ -96,54 +166,58 @@ function ToolFallbackRoot({
 
 type ToolStatus = ToolCallMessagePartStatus["type"];
 
-// The shared app tick is icon data, not a component; wrap it to slot into the
-// status map alongside the lucide icons.
-function CompleteTickIcon(props: Omit<ComponentProps<typeof HugeiconsIcon>, "icon">) {
-  return <HugeiconsIcon icon={Tick02Icon} strokeWidth={2} {...props} />;
+// Not a tick: "Used tool" already says it finished.
+function completeToolIcon(name: string): ElementType {
+  return name.startsWith("browser_") ? InternetGlyph : WrenchIcon;
 }
 
-const statusIconMap: Record<ToolStatus, ElementType> = {
+const statusIconMap: Record<Exclude<ToolStatus, "complete">, ElementType> = {
   running: LoaderIcon,
-  complete: CompleteTickIcon,
   incomplete: XCircleIcon,
   "requires-action": AlertCircleIcon,
 };
 
-const MCP_TOOL_PREFIX = "mcp__";
-
-function formatToolNameForDisplay(toolName: string): string {
-  if (!toolName.startsWith(MCP_TOOL_PREFIX)) return toolName;
-  const rest = toolName.slice(MCP_TOOL_PREFIX.length);
-  const sep = rest.indexOf("__");
-  if (sep <= 0) return toolName;
-  return `${rest.slice(0, sep)} · ${rest.slice(sep + 2)}`;
-}
-
 function ToolFallbackTrigger({
   toolName,
+  mcpServer,
+  mcpTool,
   status,
   icon: ToolIcon,
+  singleLine = false,
   className,
   ...props
 }: ComponentProps<typeof CollapsibleTrigger> & {
-  toolName: string;
+  // Straight off the wire: provider SSE is relayed verbatim, and a non-string
+  // name matches nothing in thread.tsx's by_name map, which is exactly why it
+  // lands HERE, where formatMcpToolName calls `.startsWith` on it.
+  toolName: unknown;
+  mcpServer?: string;
+  mcpTool?: string;
   status?: ToolCallMessagePartStatus;
   icon?: ElementType;
+  /** Keep the label to one line when open, for a label that repeats an argument the content shows in full. */
+  singleLine?: boolean;
 }) {
+  const wrapWhenOpen = !singleLine;
   const statusType = status?.type ?? "complete";
-  const isRunning = statusType === "running";
-  const isCancelled =
-    status?.type === "incomplete" && status.reason === "cancelled";
+  const isRunning = isToolCallRunning(status);
+  const isCancelled = isToolCallCancelled(status);
 
-  const StatusIcon = statusIconMap[statusType];
-  const label = isCancelled ? "Cancelled tool" : "Used tool";
-  const displayName = formatToolNameForDisplay(toolName);
+  const label = toolFallbackLabel(status);
+  const name = toolArgText(toolName);
+  const StatusIcon =
+    statusType === "complete"
+      ? completeToolIcon(name)
+      : statusIconMap[statusType];
+  const displayName = formatMcpToolName(name, mcpServer, mcpTool) ?? name;
 
   return (
     <CollapsibleTrigger
       data-slot="tool-fallback-trigger"
       className={cn(
-        "aui-tool-fallback-trigger group/trigger flex w-full cursor-pointer items-center gap-2 py-1.5 text-sm transition-colors",
+        // Brightens on hover like the Thinking trigger. The icon inherits this; the label
+        // sets its own colour and picks it up through the group below.
+        "aui-tool-fallback-trigger group/trigger flex w-full cursor-pointer items-center gap-2 text-trace-foreground text-sm transition-colors hover:text-foreground",
         className,
       )}
       {...props}
@@ -153,35 +227,31 @@ function ToolFallbackTrigger({
       ) : ToolIcon ? (
         <ToolIcon
           data-slot="tool-fallback-trigger-icon"
-          className={cn(
-            "aui-tool-fallback-trigger-icon size-4 shrink-0",
-            isCancelled && "text-muted-foreground",
-          )}
+          className="aui-tool-fallback-trigger-icon size-4 shrink-0"
         />
       ) : (
         <StatusIcon
           data-slot="tool-fallback-trigger-icon"
-          className={cn(
-            "aui-tool-fallback-trigger-icon size-4 shrink-0",
-            isCancelled && "text-muted-foreground",
-          )}
+          className="aui-tool-fallback-trigger-icon size-4 shrink-0"
         />
       )}
       <span
         data-slot="tool-fallback-trigger-label"
         className={cn(
-          "aui-tool-fallback-trigger-label-wrapper relative min-w-0 text-left leading-none text-muted-foreground",
-          isCancelled && "text-muted-foreground line-through",
+          "aui-tool-fallback-trigger-label-wrapper relative min-w-0 text-left leading-none text-trace-foreground transition-colors",
+          // A cancelled row stays muted: the strikethrough is the point, not the name.
+          isCancelled ? "line-through" : "group-hover/trigger:text-foreground",
         )}
       >
         <span
           className={cn(
             "block truncate leading-normal",
-            "group-data-[state=open]/trigger:overflow-visible group-data-[state=open]/trigger:whitespace-normal group-data-[state=open]/trigger:break-words",
+            wrapWhenOpen &&
+              "group-data-[state=open]/trigger:overflow-visible group-data-[state=open]/trigger:whitespace-normal group-data-[state=open]/trigger:break-words",
           )}
         >
           {label}:{" "}
-          <span className="font-medium text-foreground/85">{displayName}</span>
+          <span className="font-medium">{displayName}</span>
         </span>
         {isRunning && (
           <span
@@ -189,11 +259,12 @@ function ToolFallbackTrigger({
             data-slot="tool-fallback-trigger-shimmer"
             className={cn(
               "aui-tool-fallback-trigger-shimmer shimmer pointer-events-none absolute inset-0 block truncate leading-normal motion-reduce:animate-none",
+              wrapWhenOpen &&
               "group-data-[state=open]/trigger:overflow-visible group-data-[state=open]/trigger:whitespace-normal group-data-[state=open]/trigger:break-words",
             )}
           >
             {label}:{" "}
-            <span className="font-medium text-foreground/85">{displayName}</span>
+            <span className="font-medium">{displayName}</span>
           </span>
         )}
       </span>
@@ -219,7 +290,7 @@ function ToolFallbackContent({
     <CollapsibleContent
       data-slot="tool-fallback-content"
       className={cn(
-        "aui-tool-fallback-content relative overflow-hidden text-sm outline-none",
+        "aui-tool-fallback-content relative overflow-hidden text-trace-foreground text-sm outline-none",
         "group/collapsible-content ease-out",
         "data-[state=closed]:animate-collapsible-up",
         "data-[state=open]:animate-collapsible-down",
@@ -231,7 +302,7 @@ function ToolFallbackContent({
       )}
       {...props}
     >
-      <div className="mt-1 flex flex-col gap-2 pl-5">{children}</div>
+      <div className="mt-2 flex flex-col gap-2 pl-5">{children}</div>
     </CollapsibleContent>
   );
 }
@@ -253,7 +324,7 @@ function ToolFallbackArgs({
       className={cn("aui-tool-fallback-args", className)}
       {...props}
     >
-      <pre className="aui-tool-fallback-args-value whitespace-pre-wrap">
+      <pre className="aui-tool-fallback-args-value whitespace-pre-wrap text-xs">
         {argsText}
       </pre>
     </div>
@@ -284,6 +355,34 @@ function isMcpImageResult(val: unknown): val is McpImageResult {
   );
 }
 
+/** Outside ToolFallbackContent so it stays on screen with the card collapsed. */
+function ToolFallbackMcpApp({
+  toolName,
+  result,
+  argsText,
+}: {
+  toolName: string;
+  result: McpUiToolResult;
+  argsText?: string;
+}) {
+  const threadId = useAuiState(({ threadListItem }) => threadListItem.remoteId);
+  // The provider's project (the store's lags a thread switch): the adapter keys the run's session on it.
+  const projectId = useChatProjectScope();
+  const parts = splitMcpToolName(toolName);
+  if (!parts) return null;
+  return (
+    <McpAppFrame
+      serverId={parts.serverId}
+      toolName={parts.tool}
+      ui={result.ui}
+      argsText={argsText}
+      resultImages={result.images}
+      threadId={threadId}
+      sessionId={sandboxSessionIdFor(threadId, projectId)}
+    />
+  );
+}
+
 function ToolFallbackResult({
   result,
   className,
@@ -296,6 +395,9 @@ function ToolFallbackResult({
   }
 
   const imageResult = isMcpImageResult(result) ? result : null;
+  // Colourised CLIs (ls --color, grep --color, npm, cargo, pytest) emit SGR escapes that a plain
+  // <pre> cannot style; strip them so the pane stays readable (#7962).
+  const resultText = imageResult ? null : stringifyToolResult(result);
 
   return (
     <div
@@ -307,8 +409,8 @@ function ToolFallbackResult({
       {imageResult ? (
         <>
           {imageResult.text && (
-            <pre className="aui-tool-fallback-result-content whitespace-pre-wrap">
-              {imageResult.text}
+            <pre className="aui-tool-fallback-result-content whitespace-pre-wrap text-xs">
+              {stripAnsi(imageResult.text)}
             </pre>
           )}
           <div className="mt-2 flex flex-col gap-2">
@@ -324,8 +426,8 @@ function ToolFallbackResult({
           </div>
         </>
       ) : (
-        <pre className="aui-tool-fallback-result-content whitespace-pre-wrap">
-          {typeof result === "string" ? result : JSON.stringify(result, null, 2)}
+        <pre className="aui-tool-fallback-result-content whitespace-pre-wrap text-xs">
+          {resultText}
         </pre>
       )}
     </div>
@@ -378,24 +480,60 @@ const ToolFallbackImpl: ToolCallMessagePartComponent = ({
   argsText,
   result,
   status,
+  ...rest
 }) => {
   // Allow/Deny confirmation controls are rendered uniformly for every tool
   // card (built-in and fallback) by the `withToolConfirmation` wrapper in
   // thread.tsx, so this renderer stays purely presentational.
-  const isCancelled =
-    status?.type === "incomplete" && status.reason === "cancelled";
+  const provenance = (rest as { provenance?: unknown }).provenance;
+  const isCancelled = isToolCallCancelled(status);
+  // A widget result's pane shows the text (and images) the model saw, never its UI seed.
+  const widget = isMcpUiToolResult(result, toolName) ? result : null;
+  // edit_file comes wrapped when it created a file: the pane shows its text, the file row sits below.
+  const created =
+    SANDBOX_FILE_TOOLS.has(toolName) && isSandboxToolResult(result)
+      ? (result as { text: string; sessionId: string; files?: SandboxFile[] })
+      : null;
+  const shown = created
+    ? created.text
+    : widget?.images?.length
+      ? { text: widget.text, images: widget.images }
+      : (widget?.text ?? result);
 
   return (
-    <ToolFallbackRoot className={cn(isCancelled && "bg-muted/30")}>
-      <ToolFallbackTrigger toolName={toolName} status={status} />
+    <ToolFallbackRoot
+      className={cn(isCancelled && "bg-muted/30")}
+      defaultOpen={isToolCallRunning(status)}
+    >
+      <ToolFallbackTrigger
+        toolName={toolName}
+        mcpServer={mcpServerFromProvenance(provenance)}
+        mcpTool={mcpToolFromProvenance(provenance)}
+        status={status}
+      />
+      {!isCancelled && widget && (
+        <ToolFallbackMcpApp
+          toolName={toolName}
+          result={widget}
+          argsText={argsText}
+        />
+      )}
       <ToolFallbackContent>
         <ToolFallbackError status={status} />
         <ToolFallbackArgs
           argsText={argsText}
           className={cn(isCancelled && "opacity-60")}
         />
-        {!isCancelled && <ToolFallbackResult result={result} />}
+        {!isCancelled && <ToolFallbackResult result={shown} />}
       </ToolFallbackContent>
+      {/* Files stay outside even when the card is collapsed (#10425) */}
+      {created && (
+        <SandboxFiles
+          className="ml-5"
+          sessionId={created.sessionId}
+          files={created.files ?? []}
+        />
+      )}
     </ToolFallbackRoot>
   );
 };

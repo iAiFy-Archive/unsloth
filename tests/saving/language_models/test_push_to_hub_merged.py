@@ -1,3 +1,15 @@
+# tests/saving scripts run their whole body at import, so skip collection unless opted in.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
+from tests.utils.os_utils import require_opt_in as _require_opt_in
+
+_require_opt_in(
+    "UNSLOTH_RUN_SAVING_SCRIPTS",
+    "GPU + Hub saving script; its body runs at import.",
+)
+
 from unsloth import FastLanguageModel, FastVisionModel, UnslothVisionDataCollator
 from unsloth.chat_templates import get_chat_template
 from trl import SFTTrainer, SFTConfig
@@ -150,7 +162,6 @@ success = {
     "download": False,
 }
 
-# Stage 1: Upload model to Hub.
 try:
     print("\n" + "=" * 80)
     print("=== UPLOADING MODEL TO HUB ===".center(80))
@@ -163,7 +174,6 @@ except Exception as e:
     raise Exception("Model upload failed.")
 
 t
-# Stage 2: Test downloading the model.
 safe_remove_directory(f"./{hf_username}")
 
 try:
@@ -177,7 +187,6 @@ except Exception as e:
     print(f"❌ Download failed: {e}")
     raise Exception("Model download failed.")
 
-# Final report.
 print("\n" + "=" * 80)
 print("=== VALIDATION REPORT ===".center(80))
 print("=" * 80 + "\n")
@@ -191,6 +200,5 @@ if all(success.values()):
 else:
     raise Exception("Validation failed for one or more stages.")
 
-# final cleanup.
 safe_remove_directory("./outputs")
 safe_remove_directory("./unsloth_compiled_cache")

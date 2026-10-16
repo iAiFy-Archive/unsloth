@@ -20,11 +20,15 @@ from picker.service import (
 def test_iter_ggufs_skips_gguf_companions(tmp_path):
     mtp_dir = tmp_path / "MTP"
     mtp_dir.mkdir()
+    dspark_dir = tmp_path / "dspark"
+    dspark_dir.mkdir()
     main = tmp_path / "model-Q8_0.gguf"
     main.write_bytes(b"")
     (tmp_path / "mmproj-F16.gguf").write_bytes(b"")
     (tmp_path / "mtp-model-Q8_0.gguf").write_bytes(b"")
     (mtp_dir / "model-Q8_0-MTP.gguf").write_bytes(b"")
+    # A DSpark drafter has its own chat template; probing it reads the wrong one.
+    (dspark_dir / "dspark-model-Q8_0.gguf").write_bytes(b"")
     (tmp_path / "model-Q8_0-be.gguf").write_bytes(b"")
 
     assert _iter_ggufs(tmp_path) == [main]
@@ -197,10 +201,11 @@ def test_processor_json_over_size_limit_is_skipped_not_parsed(tmp_path):
 
 
 def test_tokenizer_config_at_size_limit_is_still_read(tmp_path):
-    # A normal-sized config is unaffected by the bound (regression guard).
-    (tmp_path / "tokenizer_config.json").write_text(
-        json.dumps({"chat_template": "FROM_CONFIG"}), encoding = "utf-8"
-    )
+    # The bound is inclusive: a file of exactly MAX_TEMPLATE_METADATA_BYTES is read.
+    body = json.dumps({"chat_template": "FROM_CONFIG", "_pad": ""})
+    body = body[:-2] + "x" * (MAX_TEMPLATE_METADATA_BYTES - len(body)) + body[-2:]
+    assert len(body.encode("utf-8")) == MAX_TEMPLATE_METADATA_BYTES
+    (tmp_path / "tokenizer_config.json").write_text(body, encoding = "utf-8", newline = "")
     assert _chat_template_from_tokenizer_dir(tmp_path) == "FROM_CONFIG"
 
 
@@ -210,7 +215,9 @@ def test_remote_template_over_size_limit_is_skipped_before_download(monkeypatch)
     import huggingface_hub
 
     monkeypatch.setattr("picker.service.resolve_cached_repo_id_case", lambda name: name)
-    monkeypatch.setattr("picker.service.iter_hf_cache_snapshots", lambda resolved: [])
+    monkeypatch.setattr(
+        "picker.service.iter_snapshots_preferring_whole", lambda resolved, variant: []
+    )
 
     def _fail_download(*args, **kwargs):
         raise AssertionError("oversized remote template must not be downloaded")
@@ -245,7 +252,9 @@ def test_remote_oversized_jinja_falls_through_to_tokenizer_template(tmp_path, mo
     observed_cache_dirs = []
 
     monkeypatch.setattr("picker.service.resolve_cached_repo_id_case", lambda name: name)
-    monkeypatch.setattr("picker.service.iter_hf_cache_snapshots", lambda resolved: [])
+    monkeypatch.setattr(
+        "picker.service.iter_snapshots_preferring_whole", lambda resolved, variant: []
+    )
     monkeypatch.setattr("picker.service.active_hf_hub_cache", lambda: str(selected_cache))
 
     def _fake_download(repo_id, rel, **kwargs):

@@ -20,7 +20,6 @@ def safe_remove_directory(path):
         return False
 
 
-# Used by formatting_prompts_func below.
 tokenizer = None
 
 
@@ -33,7 +32,6 @@ def formatting_prompts_func(examples):
     return {"text": texts}
 
 
-# --- Load 4-bit Model and Train ---
 print("Loading 4-bit Mxfp4 gpt-oss model for training...")
 max_seq_length = 1024
 model, tokenizer = FastLanguageModel.from_pretrained(
@@ -79,17 +77,15 @@ print("Starting fine-tuning...")
 trainer.train()
 print("Fine-tuning complete.")
 
-# --- Merge and Save ---
 print("\n💾 Merging and saving the 16-bit model to './gpt-oss-finetuned-merged'...")
 model.save_pretrained_merged(save_directory = "./gpt-oss-finetuned-merged", tokenizer = tokenizer)
 print("✅ Model merged and saved.")
 
-# --- Cleanup ---
 print("\n🧹 Cleaning up training artifacts...")
 del model, trainer, tokenizer, dataset
 torch.cuda.empty_cache()
 gc.collect()
 
 safe_remove_directory("./outputs")
-safe_remove_directory("./unsloth_compiled_cache")  # cache created by this process
+safe_remove_directory("./unsloth_compiled_cache")
 print("✅ Cleanup complete. Exiting training script.")

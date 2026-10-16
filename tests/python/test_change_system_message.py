@@ -13,7 +13,8 @@ def _load_change_system_message():
     funcs = [
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_change_system_message"
+        if isinstance(node, ast.FunctionDef)
+        and node.name in ("_change_system_message", "_escape_jinja_literal")
     ]
     namespace = {
         "re": re,
@@ -30,7 +31,6 @@ CUSTOM = "mycustom"  # no predefined default
 
 
 def test_custom_template_fills_placeholder():
-    # A {system_message} placeholder must be filled, not left literal.
     fn = _load_change_system_message()
     template, used = fn("System: {system_message}\nUser:", CUSTOM, "You are a pirate")
     assert template == "System: You are a pirate\nUser:"
@@ -39,8 +39,7 @@ def test_custom_template_fills_placeholder():
 
 
 def test_custom_template_preserves_backslashes():
-    # str.replace not re.sub: re.sub treats backslashes specially (r"C:\Users"
-    # bad-escape, r"\1" group ref), so messages must be inserted verbatim.
+    # str.replace, not re.sub: backslashes in messages must be inserted verbatim.
     fn = _load_change_system_message()
     for msg in (r"C:\Users\me", r"\frac{a}{b}", r"see \1 here"):
         template, used = fn("System: {system_message}", CUSTOM, msg)
@@ -49,7 +48,6 @@ def test_custom_template_preserves_backslashes():
 
 
 def test_custom_template_requires_system_message():
-    # A placeholder with no system message must raise, not stay literal.
     fn = _load_change_system_message()
     with pytest.raises(ValueError):
         fn("System: {system_message}", CUSTOM, None)
@@ -62,10 +60,19 @@ def test_custom_template_without_placeholder_unchanged():
 
 
 def test_predefined_template_uses_default_then_override():
-    # Predefined templates with a default are unaffected.
     fn = _load_change_system_message()
     t1, u1 = fn("System: {system_message}", "unsloth", None)
     assert t1 == "System: You are a helpful assistant to the user"
     t2, u2 = fn("System: {system_message}", "unsloth", "Custom override")
     assert t2 == "System: Custom override"
     assert u2 == "Custom override"
+
+
+def test_predefined_template_escapes_but_custom_does_not():
+    # Predefined templates escape {system_message} inside a Jinja literal; custom ones keep it raw.
+    fn = _load_change_system_message()
+    msg = """it's a \\test "x"."""
+    predefined, used = fn("System: {system_message}", "unsloth", msg)
+    assert predefined == """System: it\\'s a \\\\test \\"x\\"."""
+    assert used == msg
+    assert fn("System: {system_message}", CUSTOM, msg)[0] == f"System: {msg}"

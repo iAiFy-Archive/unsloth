@@ -1,3 +1,15 @@
+# tests/saving scripts run their whole body at import, so skip collection unless opted in.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
+from tests.utils.os_utils import require_opt_in as _require_opt_in
+
+_require_opt_in(
+    "UNSLOTH_RUN_SAVING_SCRIPTS",
+    "GPU + Hub saving script; its body runs at import.",
+)
+
 from unsloth import FastLanguageModel, FastModel
 from transformers import CsmForConditionalGeneration
 import torch
@@ -46,7 +58,6 @@ model, tokenizer = FastLanguageModel.from_pretrained(
     max_seq_length = max_seq_length,
     dtype = None,
     load_in_4bit = False,
-    # token = "hf_...", # use one if using gated models like meta-llama/Llama-2-7b-hf
 )
 
 base_model_class = model.__class__.__name__
@@ -103,7 +114,7 @@ print("🔍 SECTION 4: Saving and Merging Model")
 print(f"{'='*80}")
 
 with warnings.catch_warnings():
-    warnings.simplefilter("error")  # save/merge must emit no warnings
+    warnings.simplefilter("error")
     try:
         model.save_pretrained_merged("lasa", tokenizer)
         print("✅ Model saved and merged successfully without warnings!")
@@ -120,11 +131,8 @@ model, tokenizer = FastLanguageModel.from_pretrained(
     max_seq_length = max_seq_length,
     dtype = None,
     load_in_4bit = False,
-    # token = "hf_...", # use one if using gated models like meta-llama/Llama-2-7b-hf
 )
 
-# from transformers import AutoProcessor
-# processor = AutoProcessor.from_pretrained("unsloth/csm-1b")
 
 print("✅ Model loaded for inference successfully!")
 
@@ -135,7 +143,6 @@ print(f"{'='*80}")
 
 
 from transformers import pipeline
-import torch
 
 output_audio_path = "lasa_audio.wav"
 input_text = "Hey there my name is Elise, <giggles> and I'm a speech generation model that can sound like a person."
@@ -191,7 +198,6 @@ with torch.inference_mode():
 
     speech_tokens = tokenizer.batch_decode(generated_ids, skip_special_tokens = True)
 
-    # Convert token <|s_23456|> to int 23456.
     speech_tokens = extract_speech_ids(speech_tokens)
 
     speech_tokens = torch.tensor(speech_tokens).cpu().unsqueeze(0).unsqueeze(0)
@@ -202,8 +208,6 @@ try:
 except Exception as e:
     assert False, f"Inference failed with exception: {e}"
 
-
-## assert that transcribed_text contains The birch canoe slid on the smooth planks. Glued the sheet to the dark blue background. It's easy to tell the depth of a well. Four hours of steady work faced us.
 
 print("✅ All sections passed successfully!")
 

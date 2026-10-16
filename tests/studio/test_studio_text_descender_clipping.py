@@ -24,31 +24,41 @@ APP_SIDEBAR = WORKDIR / "studio" / "frontend" / "src" / "components" / "app-side
 
 def _read(path: Path) -> str:
     assert path.exists(), f"missing source file: {path}"
-    return path.read_text()
+    return path.read_text(encoding = "utf-8")
+
+
+# The model name truncates in its own span inside the label, inheriting its line height.
+TRIGGER_LABEL_CLASSES = frozenset({"font-heading", "text-ui-16", "whitespace-nowrap"})
+TRIGGER_NAME_SPAN = '<span className="min-w-0 truncate">{triggerTitle}</span>'
+
+
+SIDEBAR_ACCOUNT_CLASSES = frozenset(
+    {"flex", "flex-1", "flex-col", "group-data-[collapsible=icon]:hidden"}
+)
+
+
+def _class_lists(src: str, required: frozenset) -> list[str]:
+    """Matches literals by their class tokens, not the attribute, so a cn() override is still checked."""
+    return [
+        literal for literal in re.findall(r'"([^"\n]*)"', src) if required <= set(literal.split())
+    ]
 
 
 def test_model_selector_trigger_label_uses_leading_tight():
     src = _read(MODEL_SELECTOR)
-    pattern = re.compile(
-        r'<span\s+className="[^"]*\bmin-w-0\b[^"]*\bflex-1\b[^"]*\btruncate\b[^"]*\bfont-heading\b[^"]*\btext-ui-16[^"]*"',
-    )
-    matches = pattern.findall(src)
+    matches = _class_lists(src, TRIGGER_LABEL_CLASSES)
     assert matches, "could not find ModelSelectorTrigger model-name span"
+    assert TRIGGER_NAME_SPAN in src, "the model name no longer truncates inside the label"
     for cls in matches:
-        assert "leading-tight" in cls, f"expected leading-tight, got: {cls}"
-        assert "leading-none" not in cls, f"leading-none must not coexist with truncate here: {cls}"
+        assert "leading-tight" in cls.split(), f"expected leading-tight, got: {cls}"
+        assert (
+            "leading-none" not in cls.split()
+        ), f"leading-none must not coexist with truncate here: {cls}"
 
 
 def test_sidebar_account_block_uses_leading_tight():
     src = _read(APP_SIDEBAR)
-    class_names = re.findall(r'<div\s+className="([^"]+)"', src)
-    required = {
-        "flex",
-        "flex-1",
-        "flex-col",
-        "group-data-[collapsible=icon]:hidden",
-    }
-    matches = [classes for classes in class_names if required <= set(classes.split())]
+    matches = _class_lists(src, SIDEBAR_ACCOUNT_CLASSES)
     assert matches, "could not find sidebar account-block parent div"
     for classes in matches:
         leading_classes = [cls for cls in classes.split() if cls.startswith("leading-")]

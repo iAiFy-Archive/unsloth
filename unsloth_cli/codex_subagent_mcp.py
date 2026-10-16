@@ -16,6 +16,7 @@ from typing import Any
 
 from unsloth_cli.claude_subagent_mcp import _bounded, _stop_child, serve
 from unsloth_cli.commands.start import (
+    _CODEX_AUTO_ROUTE_TOOL_DESCRIPTION,
     _CODEX_ENV_KEY,
     _CODEX_ENV_UNSET,
     _CODEX_PROFILE,
@@ -25,6 +26,8 @@ from unsloth_cli.commands.start import (
     _CODEX_SUBAGENT_ROUTING_INSTRUCTIONS,
     _SUBAGENT_INSTRUCTIONS,
     _merge_wslenv,
+    _prefer_windows_cmd_sibling,
+    _resolved_launch_command,
     _wsl_shim_env,
 )
 
@@ -48,9 +51,10 @@ def _config() -> dict:
     return config
 
 
-def _result_text(stdout: str) -> str:
+def _events(stdout: str) -> tuple[list[str], list[str], list[dict]]:
     messages = []
     errors = []
+    commands = []
     for line in stdout.splitlines():
         try:
             event = json.loads(line)
@@ -67,22 +71,45 @@ def _result_text(stdout: str) -> str:
             and item["text"].strip()
         ):
             messages.append(item["text"].strip())
+        if (
+            event.get("type") == "item.completed"
+            and isinstance(item, dict)
+            and item.get("type") == "command_execution"
+        ):
+            commands.append(item)
         if event.get("type") in ("error", "turn.failed"):
             detail = event.get("message") or event.get("error")
             if isinstance(detail, dict):
                 detail = detail.get("message") or json.dumps(detail)
             if detail:
                 errors.append(str(detail))
+    return messages, errors, commands
+
+
+def _result_text(stdout: str, show_last_command: bool = False) -> str:
+    messages, errors, commands = _events(stdout)
     if errors:
         raise RuntimeError(_bounded(errors[-1]))
-    if messages:
-        return _bounded(messages[-1])
-    raise RuntimeError("The local Codex agent returned no readable result.")
+    if not messages:
+        raise RuntimeError("The local Codex agent returned no readable result.")
+    if show_last_command and commands:
+        # A small local model can report an edit that its own command never made; the raw output lets the parent check.
+        last = commands[-1]
+        output = str(last.get("aggregated_output") or "")[-2000:]
+        return _bounded(
+            f"{messages[-1]}\n\nLast command it ran: {last.get('command')}\n"
+            f"Exit code: {last.get('exit_code')}\nOutput:\n{output}"
+        )
+    return _bounded(messages[-1])
 
 
-def run_local_agent(task: str, cancel_event: threading.Event | None = None) -> str:
+def run_local_agent(
+    task: str,
+    cancel_event: threading.Event | None = None,
+    show_last_command: bool = False,
+) -> str:
     config = _config()
-    executable = shutil.which("codex")
+    executable = _prefer_windows_cmd_sibling(shutil.which("codex"))
     if executable is None:
         raise RuntimeError("`codex` is not installed or is not on PATH.")
     cancel_event = cancel_event or threading.Event()
@@ -99,6 +126,9 @@ def run_local_agent(task: str, cancel_event: threading.Event | None = None) -> s
         "--oss",
         "--profile",
         _CODEX_PROFILE,
+        # Codex otherwise waits forever for a refused connection, so a stopped server hung the parent's call.
+        "-c",
+        "features.unbounded_connection_retries=false",
         *permissions,
         "exec",
         "--ephemeral",
@@ -129,12 +159,17 @@ def run_local_agent(task: str, cancel_event: threading.Event | None = None) -> s
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
     }
     if os.name == "nt":
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         popen_kwargs["start_new_session"] = True
-    process = subprocess.Popen([executable, *command[1:]], **popen_kwargs)
+    # cmd.exe splits CR/LF inside `%*` and the prompt always spans lines, so resolve npm shims rather
+    # than spawning the .cmd raw.
+    launch_command = _resolved_launch_command(executable, command[1:], child_env)
+    process = subprocess.Popen(launch_command, **popen_kwargs)
     try:
         while True:
             try:
@@ -149,20 +184,43 @@ def run_local_agent(task: str, cancel_event: threading.Event | None = None) -> s
             _stop_child(process)
         raise
     if process.returncode != 0:
-        detail = stderr.strip() or stdout.strip()
+        # stderr is codex's own banner; the last error event says why the run stopped.
+        errors = _events(stdout)[1]
+        detail = (errors[-1] if errors else "") or stderr.strip() or stdout.strip()
         raise RuntimeError(
             _bounded(detail) or f"Local Codex exited with code {process.returncode}."
         )
-    return _result_text(stdout)
+    return _result_text(stdout, show_last_command)
 
 
 def main() -> None:
     if len(sys.argv) > 1:
         os.environ[_CODEX_SUBAGENT_CONFIG_ENV] = sys.argv[1]
+    try:
+        auto_route = _config().get("auto_route") is True
+    except RuntimeError:
+        auto_route = False
+    run_agent = run_local_agent
+    if auto_route:
+
+        def run_agent(task: str, cancel_event: threading.Event) -> str:
+            try:
+                return run_local_agent(task, cancel_event, show_last_command = True)
+            except Exception as exc:
+                if cancel_event.is_set():
+                    raise
+                # The parent's shell is off with --auto-route, so it must not pretend the step ran.
+                raise RuntimeError(
+                    f"{exc}\n\nThe local agent failed and your own shell is disabled in this "
+                    "session, so this step was not done. Tell the user so plainly."
+                ) from exc
+
     serve(
-        run_agent = run_local_agent,
+        run_agent = run_agent,
         tool_name = _CODEX_SUBAGENT_MCP_TOOL,
-        tool_description = _CODEX_SUBAGENT_TOOL_DESCRIPTION,
+        tool_description = (
+            _CODEX_AUTO_ROUTE_TOOL_DESCRIPTION if auto_route else _CODEX_SUBAGENT_TOOL_DESCRIPTION
+        ),
         instructions = _SERVER_INSTRUCTIONS,
     )
 

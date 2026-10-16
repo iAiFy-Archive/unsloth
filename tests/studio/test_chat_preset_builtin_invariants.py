@@ -2,6 +2,8 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
+import uuid
 import textwrap
 from pathlib import Path
 
@@ -37,24 +39,36 @@ def _require_node():
         pytest.skip("node --experimental-strip-types not available")
 
 
+def _write_atomic(path: Path, text: str):
+    """write_text truncates before writing, so a parallel worker may import an empty or partial module."""
+    fd, tmp = tempfile.mkstemp(dir = str(path.parent), prefix = path.name, suffix = ".tmp")
+    with os.fdopen(fd, "w", encoding = "utf-8") as handle:
+        handle.write(text)
+    os.replace(tmp, path)
+
+
 def _ensure_harness():
     TEMP.mkdir(parents = True, exist_ok = True)
-    (TEMP / "register.mjs").write_text(
-        "import { register } from 'node:module';\nregister('./loader.mjs', import.meta.url);\n"
+    _write_atomic(
+        TEMP / "register.mjs",
+        "import { register } from 'node:module';\nregister('./loader.mjs', import.meta.url);\n",
     )
-    (TEMP / "loader.mjs").write_text(
+    _write_atomic(
+        TEMP / "loader.mjs",
         "export function resolve(specifier, context, next) {\n"
         "  if (specifier.endsWith('/types/runtime')) return next(specifier + '.ts', context);\n"
         "  return next(specifier, context);\n"
-        "}\n"
+        "}\n",
     )
 
 
 def _run(script: str):
     _require_node()
     _ensure_harness()
-    script_path = TEMP / "run.mts"
-    script_path.write_text(script)
+    # Unique name: a shared run.mts let xdist workers run each other's script. Not a per-call
+    # dir: these scripts import sources by a path relative to TEMP.
+    script_path = TEMP / f"run_{uuid.uuid4().hex}.mts"
+    script_path.write_text(script, encoding = "utf-8")
     env = dict(os.environ, NODE_NO_WARNINGS = "1")
     result = subprocess.run(
         [
@@ -62,7 +76,7 @@ def _run(script: str):
             "--experimental-strip-types",
             "--import=./register.mjs",
             "--no-warnings",
-            "run.mts",
+            script_path.name,
         ],
         cwd = str(TEMP),
         capture_output = True,
@@ -70,6 +84,7 @@ def _run(script: str):
         timeout = 30,
         env = env,
     )
+    script_path.unlink(missing_ok = True)
     assert result.returncode == 0, f"stderr: {result.stderr}\nstdout: {result.stdout}"
     last = [line for line in result.stdout.strip().splitlines() if line.strip()][-1]
     return json.loads(last)

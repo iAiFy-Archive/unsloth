@@ -19,16 +19,18 @@ import {
 import { FolderBrowser } from "@/features/model-picker";
 import {
   AlertCircleIcon,
-  ArrowRight01Icon,
   CancelCircleIcon,
   CheckmarkCircle02Icon,
   FolderSearchIcon,
   Key01Icon,
 } from "@hugeicons/core-free-icons";
+import {
+  ChevronRightIcon,
+} from "lucide-react";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { useEffect, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
-import type { ExportLogEntry } from "../api/export-api";
+import type { ExportDrafterInfo, ExportLogEntry } from "../api/export-api";
 import {
   EXPORT_METHODS,
   type ExportMethod,
@@ -102,6 +104,7 @@ export interface ExportRunPanelProps {
   destination: ExportDestination;
   onDestinationChange: (v: ExportDestination) => void;
   saveDirectory: string;
+  saveDirectoryInput: string;
   defaultSaveDirectory: string;
   saveDirectoryOverridden: boolean;
   onSaveDirectoryChange: (v: string | null) => void;
@@ -117,6 +120,8 @@ export interface ExportRunPanelProps {
   onStart: () => void;
   /** Collapse the panel; only offered before a run or after a terminal one. */
   onClose: () => void;
+  /** Decision model: output goes to the run folder's gguf/ only; this note replaces the destination picker. */
+  decisionNote?: string;
 }
 
 export function ExportRunPanel(props: ExportRunPanelProps) {
@@ -129,9 +134,11 @@ export function ExportRunPanel(props: ExportRunPanelProps) {
     destination,
     onDestinationChange,
     saveDirectory,
+    saveDirectoryInput,
     defaultSaveDirectory,
     saveDirectoryOverridden,
     onSaveDirectoryChange,
+    decisionNote,
     hfUsername,
     onHfUsernameChange,
     modelName,
@@ -212,6 +219,10 @@ export function ExportRunPanel(props: ExportRunPanelProps) {
     (v) => findMergedFormat(v)?.label ?? v,
   );
   const showProgress = isExporting || isTerminal;
+  const hubRepoMissing =
+    destination === "hub" &&
+    !decisionNote &&
+    (!hfUsername.trim() || !modelName.trim());
 
   return (
     <div className="flex flex-col gap-4 rounded-2xl border border-border/50 bg-muted/20 p-4">
@@ -240,7 +251,12 @@ export function ExportRunPanel(props: ExportRunPanelProps) {
       </div>
 
       {/* Destination configuration (only before a run starts) */}
-      {showConfig && (
+      {showConfig && decisionNote && (
+        <p className="break-all rounded-lg border p-3 text-xs text-muted-foreground">
+          {decisionNote}
+        </p>
+      )}
+      {showConfig && !decisionNote && (
         <>
           <div className="flex gap-2">
             <Button
@@ -279,7 +295,7 @@ export function ExportRunPanel(props: ExportRunPanelProps) {
               <div className="flex items-stretch gap-2">
                 <Input
                   className="min-w-0 flex-1 font-mono text-ui-12"
-                  value={saveDirectory}
+                  value={saveDirectoryInput}
                   onChange={(e) => onSaveDirectoryChange(e.target.value)}
                   spellCheck={false}
                   title={saveDirectory}
@@ -318,7 +334,7 @@ export function ExportRunPanel(props: ExportRunPanelProps) {
 
           {destination === "hub" && (
             <div className="flex flex-col gap-4 px-0.5">
-                  <div className="grid grid-cols-2 gap-3">
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                     <div className="flex flex-col gap-1.5">
                       <label className="text-xs font-medium text-muted-foreground">
                         Username / Org
@@ -340,6 +356,11 @@ export function ExportRunPanel(props: ExportRunPanelProps) {
                       />
                     </div>
                   </div>
+                  {hubRepoMissing && (
+                    <p className="-mt-2 text-ui-11 text-muted-foreground/70">
+                      Enter a Username / Org and Model Name to push to the Hub.
+                    </p>
+                  )}
 
                   <div className="flex flex-col gap-1.5">
                     <div className="flex items-center justify-between">
@@ -353,7 +374,7 @@ export function ExportRunPanel(props: ExportRunPanelProps) {
                         className="flex items-center gap-1 text-ui-11 text-emerald-600 hover:text-emerald-700 transition-colors"
                       >
                         Get token
-                        <HugeiconsIcon icon={ArrowRight01Icon} className="size-3" />
+                        <ChevronRightIcon className="size-3" />
                       </a>
                     </div>
                     <InputGroup>
@@ -415,7 +436,7 @@ export function ExportRunPanel(props: ExportRunPanelProps) {
                   : run.result?.outputPath
                     ? [{ label: "", path: run.result.outputPath }]
                     : [];
-              const showLabels = items.length > 1;
+              const showLabels = items.length > 1 || !!decisionNote;
               return items.map((o, i) => (
                 <div
                   key={`${o.path}-${i}`}
@@ -435,6 +456,9 @@ export function ExportRunPanel(props: ExportRunPanelProps) {
                 </div>
               ));
             })()}
+            {run.result?.drafter ? (
+              <ExportDrafterNote drafter={run.result.drafter} />
+            ) : null}
           </div>
         </div>
       )}
@@ -503,7 +527,7 @@ export function ExportRunPanel(props: ExportRunPanelProps) {
       {showProgress && (
         <div className="flex flex-col gap-2">
           <div className="flex flex-wrap items-center gap-2">
-            <span className="rounded-full bg-foreground/10 px-2.5 py-1 text-ui-10 font-semibold">
+            <span className="rounded-full bg-[color-mix(in_oklab,var(--foreground)_calc(10%*var(--contrast-wash-gain,1)),transparent)] px-2.5 py-1 text-ui-10 font-semibold">
               {PHASE_LABELS[run.phase] ?? run.phase}
             </span>
             {summaryMethod === "gguf" && run.quantTotal > 1 && (
@@ -525,7 +549,7 @@ export function ExportRunPanel(props: ExportRunPanelProps) {
           </div>
           <Progress
             value={progress}
-            className="h-2 bg-foreground/[0.05]"
+            className="h-2 bg-[color-mix(in_oklab,var(--foreground)_calc(5%*var(--contrast-wash-gain,1)),transparent)]"
             indicatorClassName={
               run.phase === "error"
                 ? "bg-destructive"
@@ -576,7 +600,7 @@ export function ExportRunPanel(props: ExportRunPanelProps) {
               <div
                 ref={logScrollRef}
                 onScroll={handleLogScroll}
-                className="h-56 w-full overflow-auto rounded-lg border border-border/40 bg-black/85 p-3 font-mono text-ui-11 leading-[1.45] text-emerald-200/90"
+                className="h-56 w-full overflow-auto scroll-rounded rounded-lg border border-border/40 bg-black/85 p-3 font-mono text-ui-11 leading-[1.45] text-emerald-200/90"
               >
                 {run.logLines.length === 0 ? (
                   <div className="flex h-full items-center justify-center text-muted-foreground/70">
@@ -605,7 +629,9 @@ export function ExportRunPanel(props: ExportRunPanelProps) {
             <Button variant="outline" onClick={onClose}>
               Cancel
             </Button>
-            <Button onClick={onStart}>Start Export</Button>
+            <Button onClick={onStart} disabled={hubRepoMissing}>
+              Start Export
+            </Button>
           </>
         )}
         {isExporting && (
@@ -624,6 +650,24 @@ export function ExportRunPanel(props: ExportRunPanelProps) {
         }
         onSelect={(path) => onSaveDirectoryChange(path)}
       />
+    </div>
+  );
+}
+
+function ExportDrafterNote({ drafter }: { drafter: ExportDrafterInfo }) {
+  return (
+    <div className="flex min-w-0 flex-col gap-0.5">
+      <span>
+        Includes trained drafter ({drafter.strategy === "mtp" ? "MTP" : "EAGLE-3"})
+      </span>
+      {drafter.vllm_command ? (
+        <code
+          className="select-all whitespace-pre-wrap break-all font-mono text-ui-12 text-foreground/90"
+          title={drafter.vllm_command}
+        >
+          {drafter.vllm_command}
+        </code>
+      ) : null}
     </div>
   );
 }
