@@ -1,11 +1,7 @@
-"""NVIDIA installer probes must be timeout-bounded (audit findings 5 and 6): a wedged nvidia-smi
-must not hang the installer, and the Windows probe must require a real GPU listing (not exit code 0).
-
-Source-level asserts check the guards in install.sh / install.ps1 / setup.ps1; one behavioral
-shell test confirms the bash helper returns within the timeout when nvidia-smi hangs.
-"""
+"""NVIDIA probes must be timeout-bounded; the Windows probe must need a GPU listing, not exit code 0."""
 
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -43,9 +39,6 @@ def _extract_sh_function_body(source: str, name: str) -> str:
     return source[start:]
 
 
-# ── install.sh: _run_bounded helper and its use at every nvidia-smi call ──
-
-
 class TestInstallShBoundedProbe:
     def _src(self) -> str:
         return INSTALL_SH.read_text(encoding = "utf-8")
@@ -56,7 +49,8 @@ class TestInstallShBoundedProbe:
         assert (
             "command -v timeout" in body
         ), "_run_bounded must check for the `timeout` binary before using it"
-        assert "timeout 10" in body, "_run_bounded must apply a 10s timeout"
+        assert "_rb_secs=10" in body, "_run_bounded must apply a 10s timeout by default"
+        assert 'timeout "$_rb_secs"' in body, "_run_bounded must pass its bound to timeout"
         # Falls back to unbounded when `timeout` is absent (e.g. macOS), keeping semantics there.
         assert (
             "else" in body and '"$@"' in body
@@ -65,11 +59,9 @@ class TestInstallShBoundedProbe:
     def test_nvidia_smi_dash_l_probe_is_bounded(self):
         body = _extract_sh_function_body(self._src(), "_has_usable_nvidia_gpu")
         assert body, "install.sh must define _has_usable_nvidia_gpu"
-        # The -L probe must go through the bounded runner.
         assert (
             '_run_bounded "$_nvsmi" -L' in body
         ), "_has_usable_nvidia_gpu must run nvidia-smi -L through _run_bounded"
-        # The /proc fallback from PR 6174 must remain.
         assert "/proc/driver/nvidia" in body
 
     def test_cuda_version_parse_is_bounded(self):
@@ -80,24 +72,18 @@ class TestInstallShBoundedProbe:
         ), "get_torch_index_url CUDA-version parse must run nvidia-smi through _run_bounded"
         # Locale forced without depending on `env` being on PATH.
         assert "LC_ALL=C" in body
-        # _nvidia_detected gating from PR 6174 must remain.
         assert "_nvidia_detected" in body
 
     def test_no_unbounded_nvidia_smi_invocation_remains(self):
         """Every nvidia-smi execution goes through _run_bounded (resolution checks are allowed)."""
         body_nvidia = _extract_sh_function_body(self._src(), "_has_usable_nvidia_gpu")
         body_torch = _extract_sh_function_body(self._src(), "get_torch_index_url")
-        # The only $_nvsmi execution in _has_usable_nvidia_gpu must be bounded.
         assert '"$_nvsmi" -L' not in body_nvidia.replace(
             '_run_bounded "$_nvsmi" -L', ""
         ), "found an unbounded nvidia-smi -L execution in _has_usable_nvidia_gpu"
-        # The $_smi execution in get_torch_index_url must be bounded.
         assert (
             "LC_ALL=C $_smi" not in body_torch
         ), "found an unbounded LC_ALL=C $_smi execution in get_torch_index_url"
-
-
-# ── install.ps1 / setup.ps1: bounded, GPU-row-validated Windows probe ──
 
 
 class TestPowerShellBoundedProbe:
@@ -110,7 +96,6 @@ class TestPowerShellBoundedProbe:
         assert (
             "WaitForExit($TimeoutSec * 1000)" in src
         ), f"{path.name} bounded probe must use WaitForExit with a timeout"
-        # Kill + sentinel on timeout (mirrors Invoke-AmdSmiNoElevate).
         assert (
             "$proc.Kill()" in src and "124" in src
         ), f"{path.name} must kill nvidia-smi and signal a timeout exit code"
@@ -129,7 +114,6 @@ class TestPowerShellBoundedProbe:
     @pytest.mark.parametrize("path", [INSTALL_PS1, SETUP_PS1])
     def test_detection_uses_validated_probe(self, path):
         src = path.read_text(encoding = "utf-8")
-        # The exit-code-only probe must be gone from the detection block.
         assert (
             "& $nvSmiCmd.Source *> $null" not in src
         ), f"{path.name} must not use the exit-code-only nvidia-smi probe"
@@ -139,9 +123,6 @@ class TestPowerShellBoundedProbe:
         assert (
             "Test-NvidiaSmiHasGpu $p" in src
         ), f"{path.name} hardcoded-path fallback must use Test-NvidiaSmiHasGpu"
-
-
-# ── Behavioral: a hanging nvidia-smi must not hang _has_usable_nvidia_gpu ──
 
 
 def _have_timeout() -> bool:
@@ -164,7 +145,6 @@ def test_has_usable_nvidia_gpu_returns_under_timeout():
         fake_smi.write_text("#!/bin/sh\nsleep 30\n")
         fake_smi.chmod(fake_smi.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
-        # PATH with the fake nvidia-smi first plus the real timeout/awk/ls it needs.
         real_bins = {Path(shutil.which(c)).parent for c in ("timeout", "awk", "ls", "sh")}
         path_env = os.pathsep.join([str(fake_dir)] + [str(p) for p in real_bins])
 
@@ -181,7 +161,101 @@ def test_has_usable_nvidia_gpu_returns_under_timeout():
             text = True,
             timeout = 20,  # generous: the internal timeout is 10s, sleep is 30s
         )
-        # The probe must have returned (not hung): NONE without /proc, DETECTED via /proc fallback.
         assert proc.stdout.strip() in {"NONE", "DETECTED"}
+    finally:
+        shutil.rmtree(workdir, ignore_errors = True)
+
+
+# Highest-wins runs every ROCm version source, so any unbounded one can hang the installer.
+
+# Matched on the EXECUTION line only, so helpers may resolve the tool another way.
+_ROCM_SOURCE_PROBES = [
+    ("_rocm_tag_from_amd_smi", r"amd-smi\s+version\b"),
+    ("_rocm_tag_from_hipconfig", r"--version\b"),
+    ("_rocm_tag_from_dpkg", r"dpkg-query\s+-W\b"),
+    ("_rocm_tag_from_rpm", r"\brpm\s+-q\b"),
+]
+
+
+def _exec_lines(body: str, pattern: str) -> list:
+    """Lines that run the probe: matches `pattern` and is not a comment or a lookup guard."""
+    return [
+        line
+        for line in body.splitlines()
+        if re.search(pattern, line)
+        and not line.lstrip().startswith("#")
+        and "command -v" not in line
+        and not re.search(r"\[\s*-x\s", line)
+    ]
+
+
+class TestRocmVersionSourcesBounded:
+    def _src(self) -> str:
+        return INSTALL_SH.read_text(encoding = "utf-8")
+
+    @pytest.mark.parametrize("fn_name,pattern", _ROCM_SOURCE_PROBES)
+    def test_source_probe_is_bounded(self, fn_name, pattern):
+        body = _extract_sh_function_body(self._src(), fn_name)
+        assert body, f"install.sh must define {fn_name}"
+        lines = _exec_lines(body, pattern)
+        assert lines, f"{fn_name} no longer runs a probe matching {pattern}"
+        for line in lines:
+            assert "_run_bounded" in line, f"{fn_name} runs an unbounded probe: {line.strip()}"
+
+    @pytest.mark.parametrize("pattern", [r"amd-smi\s+version\b", r"--version\b"])
+    def test_radeon_wheel_url_probes_are_bounded(self, pattern):
+        body = _extract_sh_function_body(self._src(), "get_radeon_wheel_url")
+        assert body, "install.sh must define get_radeon_wheel_url"
+        lines = _exec_lines(body, pattern)
+        assert lines, f"get_radeon_wheel_url no longer runs a probe matching {pattern}"
+        for line in lines:
+            assert (
+                "_run_bounded" in line
+            ), f"get_radeon_wheel_url runs an unbounded probe: {line.strip()}"
+
+
+@pytest.mark.skipif(not _have_timeout(), reason = "`timeout` binary not available")
+@pytest.mark.parametrize("hanging_tool", ["dpkg-query", "hipconfig", "amd-smi"])
+def test_detect_rocm_version_tag_returns_when_a_source_hangs(hanging_tool):
+    """A wedged version source must make _detect_rocm_version_tag decline, not hang the install."""
+    src = INSTALL_SH.read_text(encoding = "utf-8")
+    parts = [
+        _extract_sh_function_body(src, name)
+        for name in (
+            "_run_bounded",
+            "_rocm_tag_from_amd_smi",
+            "_rocm_tag_from_version_file",
+            "_rocm_tag_from_hipconfig",
+            "_rocm_tag_from_dpkg",
+            "_rocm_tag_from_rpm",
+            "_highest_rocm_tag",
+            "_detect_rocm_version_tag",
+        )
+    ]
+    assert all(parts)
+
+    workdir = tempfile.mkdtemp(prefix = "rocm_probe_timeout_")
+    try:
+        fake_dir = Path(workdir, "bin")
+        fake_dir.mkdir()
+        hanging = fake_dir / hanging_tool
+        hanging.write_text("#!/bin/sh\nsleep 30\n")
+        hanging.chmod(hanging.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+        real_bins = {
+            Path(shutil.which(c)).parent for c in ("timeout", "awk", "grep", "sort", "tr", "sh")
+        }
+        path_env = os.pathsep.join([str(fake_dir)] + [str(p) for p in real_bins])
+
+        script = "\n".join(parts) + '\n_detect_rocm_version_tag\necho "RC=$?"\n'
+        proc = subprocess.run(
+            ["sh", "-c", script],
+            env = {"PATH": path_env},
+            stdout = subprocess.PIPE,
+            stderr = subprocess.DEVNULL,
+            text = True,
+            timeout = 25,  # internal bound is 10s per probe, the fake sleeps 30s
+        )
+        assert "RC=0" in proc.stdout
     finally:
         shutil.rmtree(workdir, ignore_errors = True)

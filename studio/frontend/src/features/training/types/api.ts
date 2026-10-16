@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import type { ModelInventoryFormat } from "@/features/hub";
 import type { S3Config } from "@/types/training";
 
 export interface TrainingStartRequest {
   model_name: string;
+  actual_model_repo_id?: string | null;
   project_name: string | null;
   training_type: string;
   hf_token: string | null;
+  model_known_cached?: boolean;
+  model_local_path?: string | null;
+  model_format?: ModelInventoryFormat | null;
+  model_snapshot_path?: string | null;
   load_in_4bit: boolean;
   max_seq_length: number;
   vision_image_size?: number | null;
@@ -16,6 +22,9 @@ export interface TrainingStartRequest {
   /** sha256 fingerprint pinning user approval of this exact custom-code version. */
   approved_remote_code_fingerprint?: string | null;
   hf_dataset: string | null;
+  dataset_known_cached?: boolean;
+  dataset_local_path?: string | null;
+  dataset_snapshot_path?: string | null;
   subset: string | null;
   train_split: string | null;
   eval_split: string | null;
@@ -39,8 +48,9 @@ export interface TrainingStartRequest {
   max_steps: number | null;
   save_steps: number;
   eval_steps: number;
+  early_stopping_patience?: number;
   weight_decay: number;
-  max_grad_norm: number;
+  max_grad_norm?: number | null;
   max_grad_value?: number | null;
   random_seed: number;
   packing: boolean;
@@ -52,6 +62,10 @@ export interface TrainingStartRequest {
   lora_dropout: number;
   target_modules: string[];
   gradient_checkpointing: string;
+  offload_layers: number | "auto";
+  offload_vram_gb: number | null;
+  offload_vram_gb_per_device: (number | null)[] | null;
+  prefetch_depth: number | "auto";
   use_rslora: boolean;
   use_loftq: boolean;
   use_dora: boolean;
@@ -63,22 +77,63 @@ export interface TrainingStartRequest {
   is_dataset_image: boolean;
   is_dataset_audio: boolean;
   is_embedding: boolean;
+  is_decision: boolean;
+  model_subfolder: string | null;
   enable_wandb: boolean;
   wandb_token: string | null;
   wandb_project: string | null;
   enable_tensorboard: boolean;
   tensorboard_dir: string | null;
   resume_from_checkpoint?: string | null;
+  /** Omitted unless the user turned drafter training on (requests stay byte-identical otherwise). */
+  drafter?: DrafterTrainingRequest;
+}
+
+export interface DrafterTrainingRequest {
+  enabled: boolean;
+  strategy: "auto" | "mtp" | "eagle3";
+  data_source: "dataset" | "regenerate";
+  max_examples: number;
+  epochs: number;
+  learning_rate: number | null;
+  draft_steps: number;
+}
+
+/** GET /api/train/drafter-capability: which drafter this model can train, and where it runs. */
+export interface DrafterCapability {
+  model_name: string;
+  has_native_mtp: boolean;
+  strategy: "mtp" | "eagle3" | null;
+  supported: boolean;
+  reason: string | null;
+  vllm: boolean;
+  llama_cpp: boolean;
+  /** The probe could not run (timeout, crash): retried, never a refusal. */
+  inconclusive?: boolean;
 }
 
 export interface TrainingStartResponse {
   job_id: string;
-  status: "queued" | "error";
+  status: "pending" | "queued" | "error";
   message: string;
   error: string | null;
+  error_code?: string | null;
+}
+
+export interface TrainingStartRequestStatusResponse {
+  start_request_id: string;
+  job_id: string;
+  state: "pending" | "accepted" | "rejected";
+  message: string;
+  error: string | null;
+  error_code?: string | null;
 }
 
 export interface TrainingStopResponse {
   status: "stopped" | "idle";
   message: string;
+}
+
+export interface TrainingResetResponse {
+  status: "ok" | "superseded";
 }

@@ -1,7 +1,4 @@
-"""
-Evaluate language models on the combined AIME dataset
-(test2024 + test2025-I + test2025-II).
-"""
+"""Evaluates language models on the combined AIME dataset: test2024, test2025-I and test2025-II."""
 
 import json
 import requests
@@ -41,7 +38,6 @@ def download_and_combine_aime_datasets(data_dir: str = "./data/aime") -> str:
             response = requests.get(url)
             response.raise_for_status()
 
-            # Tag each line with its source dataset + global ID
             for line_num, line in enumerate(response.text.strip().split("\n")):
                 if line.strip():
                     try:
@@ -97,10 +93,9 @@ def load_aime_dataset(data_dir: str = "./data/aime") -> List[Dict[str, Any]]:
                         "original_id": data.get("original_id", data.get("id", line_num)),
                         "source_dataset": data.get("source_dataset", "unknown"),
                         "problem": data["problem"],
-                        "answer": str(data["answer"]),  # Ensure answer is string
+                        "answer": str(data["answer"]),
                         "solution": data.get("solution", ""),
                         "url": data.get("url", ""),
-                        # Format as chat messages for the model
                         "prompt": [
                             {
                                 "role": "system",
@@ -134,14 +129,14 @@ def load_aime_dataset(data_dir: str = "./data/aime") -> List[Dict[str, Any]]:
 def extract_aime_answer(response: str) -> str:
     """Extract numerical answer from AIME response"""
 
-    # AIME answers are integers 0-999; match "The answer is 123" etc.
+    # AIME answers are integers 0-999.
     patterns = [
         r"(?:the )?(?:final )?answer is (\d{1,3})",
         r"(?:therefore|thus|so),?\s*(?:the )?(?:final )?answer is (\d{1,3})",
         r"\\boxed\{(\d{1,3})\}",
         r"\$\\boxed\{(\d{1,3})\}\$",
         r"(?:answer|result):\s*(\d{1,3})",
-        r"(?:^|\n)\s*(\d{1,3})\s*(?:\n|$)",  # Standalone number
+        r"(?:^|\n)\s*(\d{1,3})\s*(?:\n|$)",
     ]
 
     response_lower = response.lower().strip()
@@ -149,7 +144,7 @@ def extract_aime_answer(response: str) -> str:
     for pattern in patterns:
         matches = re.findall(pattern, response_lower, re.MULTILINE | re.IGNORECASE)
         if matches:
-            answer = matches[-1]  # last match = the final answer
+            answer = matches[-1]
             try:
                 num = int(answer)
                 if 0 <= num <= 999:
@@ -157,7 +152,6 @@ def extract_aime_answer(response: str) -> str:
             except ValueError:
                 continue
 
-    # Fallback: any 1-3 digit number, scanning from the end
     numbers = re.findall(r"\b(\d{1,3})\b", response)
     if numbers:
         for num_str in reversed(numbers):
@@ -223,7 +217,7 @@ def evaluate_model_aime(
         temperature = temperature,
         top_p = top_p,
         max_tokens = max_tokens,
-        n = n_sampling,  # Multiple samples per question
+        n = n_sampling,
         seed = seed,
     )
 
@@ -234,7 +228,6 @@ def evaluate_model_aime(
     print(f"   Top-p: {top_p}")
     print(f"   Seed: {seed}")
 
-    # Temporarily suppress verbose vllm/ray logging
     original_levels = {}
     loggers_to_suppress = [
         "vllm",
@@ -277,7 +270,6 @@ def evaluate_model_aime(
                     )
                     output_tokens.append(total_output_tokens)
 
-                    # Correct if any sample matches ground truth
                     ground_truth = item["answer"]
                     correct_responses = [ans == ground_truth for ans in extracted_answers]
                     is_correct = any(correct_responses)
@@ -335,7 +327,6 @@ def evaluate_model_aime(
     total_problems = len(eval_dataset)
     accuracy = correct_answers / total_problems * 100
 
-    # Pass@k: fraction of problems where at least one of k samples is correct
     pass_at_k_scores = []
     for record in records.values():
         if "n_correct" in record and "n_total" in record:
@@ -448,7 +439,7 @@ def compare_aime_results(all_results):
         print("IMPROVEMENT ANALYSIS")
         print(f"{'='*50}")
 
-        base_result = all_results[0]  # first is the base model
+        base_result = all_results[0]
 
         for i, result in enumerate(all_results[1:], 1):
             print(f"\n{result['model_type']} vs {base_result['model_type']}:")

@@ -1,37 +1,79 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""UI font size scaling regression (Settings > Appearance).
-
-Drives the real appearance controls and asserts the typography-scale
-contract: text and line heights scale by size/16, the root font size and
-layout geometry never move, an explicit Code font size stays fixed, and an
-overflowing Radix select scrolls its viewport by keyboard and wheel.
-
-Runs against an already-booted, already-bootstrapped Unsloth:
-    BASE_URL=http://127.0.0.1:18894 STUDIO_PW=... python tests/studio/playwright_ui_font_scale.py
-"""
+"""Font scale regression: text scales by size/16 while the root size and layout stay fixed."""
 
 import os
+import re
 import sys
+import time
 from pathlib import Path
 
+from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _playwright_robust import wait_for_health  # noqa: E402
+from _playwright_robust import (  # noqa: E402
+    install_wall_clock_watchdog,
+    report_failing_step,
+    step_budget_s,
+    wait_for_health,
+)
 
 BASE = os.environ["BASE_URL"]
 PW = os.environ["STUDIO_PW"]
 ART = Path(os.environ.get("PW_ART_DIR", "logs/playwright_fontscale"))
 ART.mkdir(parents = True, exist_ok = True)
 
-SIZES = (12, 20)
-DEFAULT = 16
+# Read the range from the store: the default size has already moved once (16 -> 15).
+_STORE = (
+    Path(__file__).resolve().parents[2]
+    / "studio/frontend/src/features/settings/stores/appearance-custom-store.ts"
+).read_text(encoding = "utf-8")
+_RANGE = re.search(
+    r"UI_FONT_SIZE_RANGE\s*=\s*\{\s*min:\s*(\d+),\s*max:\s*(\d+),\s*default:\s*(\d+)",
+    _STORE,
+)
+if _RANGE is None:
+    raise AssertionError("[font-scale] FAIL: no UI_FONT_SIZE_RANGE in appearance-custom-store.ts")
+SIZES = (int(_RANGE.group(1)), int(_RANGE.group(2)))
+DEFAULT = int(_RANGE.group(3))
+_BASE = re.search(r"UI_FONT_SIZE_CSS_BASE\s*=\s*(\d+)", _STORE)
+if _BASE is None:
+    raise AssertionError(
+        "[font-scale] FAIL: no UI_FONT_SIZE_CSS_BASE in appearance-custom-store.ts"
+    )
+CSS_BASE = int(_BASE.group(1))
+
+STEP_BUDGET_S = step_budget_s(180)
+WALL_TIMEOUT_S = float(os.environ.get("STUDIO_UI_WALL_TIMEOUT_S", "720"))
+_watchdog = None
+
+
+def settled_scroll_top(
+    page,
+    quiet_ms = 200,
+    timeout_ms = 5_000,
+):
+    """Poll scrollTop until it holds for quiet_ms; a read right after keypress is mid-scroll."""
+    last = page.evaluate(SCROLL_TOP_JS)
+    quiet_since = time.monotonic()
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        page.wait_for_timeout(50)
+        now = page.evaluate(SCROLL_TOP_JS)
+        if now != last:
+            last = now
+            quiet_since = time.monotonic()
+        elif (time.monotonic() - quiet_since) * 1000 >= quiet_ms:
+            return now
+    return last
 
 
 def step(s):
     print(f"[font-scale] STEP {s}", flush = True)
+    if _watchdog is not None:
+        _watchdog.begin_step(s, STEP_BUDGET_S)
 
 
 def fail(m):
@@ -45,6 +87,18 @@ def near(
 ):
     return a is not None and b is not None and abs(a - b) <= tol
 
+
+_VP = 'document.querySelector("[data-radix-select-viewport]")'
+SCROLL_TOP_JS = f"() => {_VP}.scrollTop"
+SCROLLABLE_JS = f"() => {{ const vp = {_VP}; return !!vp && vp.scrollHeight > vp.clientHeight; }}"
+VIEWPORT_STATE_JS = f"""
+() => {{
+  const vp = {_VP};
+  return vp
+    ? {{ scrollHeight: vp.scrollHeight, clientHeight: vp.clientHeight, top: vp.scrollTop }}
+    : null;
+}}
+"""
 
 MEASURE_JS = """
 () => {
@@ -74,28 +128,71 @@ def measure(page):
     return page.evaluate(MEASURE_JS)
 
 
+# data-ui-font-size is dropped at the default; --custom-code-font-size when the field is cleared.
+_APPLIED_JS = {
+    "UI font size": """(want) => document.documentElement.getAttribute("data-ui-font-size") === want""",
+    "Code font size": """(want) => (document.documentElement.style
+        .getPropertyValue("--custom-code-font-size").trim() || null) === want""",
+}
+
+
 def set_input(page, label, value):
     field = page.locator(f"input[aria-label='{label}']")
     field.scroll_into_view_if_needed()
     field.fill(str(value))
     page.keyboard.press("Enter")
-    page.wait_for_timeout(600)
+    if label == "UI font size":
+        want = None if int(value) == DEFAULT else str(value)
+    else:
+        want = f"{value}px" if str(value) else None
+    try:
+        page.wait_for_function(_APPLIED_JS[label], arg = want, timeout = 5_000)
+    except PWTimeout:
+        pass
+
+
+def wait_for_app(page):
+    """The signed-in shell is up once the sidebar's "New chat" (what measure() samples) is."""
+    page.wait_for_function(
+        """() => [...document.querySelectorAll("span, h2, label, p")].some(
+            (e) => e.textContent.trim() === "New chat")""",
+        timeout = 30_000,
+    )
+
+
+def wait_for_no_dialog(page):
+    """Escape has closed the settings dialog (best-effort, as the fixed pause it replaces was)."""
+    try:
+        page.get_by_role("dialog").first.wait_for(state = "hidden", timeout = 10_000)
+    except PWTimeout:
+        pass
 
 
 def open_appearance(page):
-    page.keyboard.press("Control+,")
-    page.wait_for_timeout(700)
-    if page.get_by_role("dialog").count() == 0:
-        page.keyboard.press("Meta+,")
-        page.wait_for_timeout(700)
-    if page.get_by_role("dialog").count() == 0:
-        fail("settings dialog did not open")
-    page.get_by_role("dialog").get_by_role("button").filter(has_text = "Appearance").first.click()
-    page.wait_for_timeout(600)
+    # The shortcut can fire before the key handler is wired, so retry while waiting on the dialog.
+    dialog = page.get_by_role("dialog")
+    for attempt in range(10):
+        page.keyboard.press("Meta+," if attempt % 2 else "Control+,")
+        try:
+            dialog.first.wait_for(state = "visible", timeout = 2_000)
+            break
+        except PWTimeout:
+            continue
+    if dialog.count() == 0:
+        fail("settings dialog did not open after 10 attempts")
+    dialog.get_by_role("button").filter(has_text = "Appearance").first.click()
+    page.locator("input[aria-label='UI font size']").wait_for(state = "visible", timeout = 15_000)
 
 
 def main():
+    global _watchdog
     wait_for_health(BASE)
+    _watchdog = install_wall_clock_watchdog(
+        WALL_TIMEOUT_S,
+        label = "font-scale",
+        total_deadline_s = WALL_TIMEOUT_S,
+    )
+    report_failing_step(_watchdog, label = "font-scale")
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(viewport = {"width": 1440, "height": 900})
@@ -105,7 +202,7 @@ def main():
             pw_field.first.fill(PW)
             page.keyboard.press("Enter")
             page.wait_for_load_state("networkidle")
-            page.wait_for_timeout(1500)
+            wait_for_app(page)
 
         step("baseline at the default size")
         open_appearance(page)
@@ -149,80 +246,97 @@ def main():
         )
         if res != "13px":
             fail(f"explicit code font size scaled: {res}")
-        code_field = page.locator("input[aria-label='Code font size']")
-        code_field.fill("")
-        page.keyboard.press("Enter")
-        page.wait_for_timeout(400)
+        set_input(page, "Code font size", "")
 
         step("overflowing select scrolls its Radix viewport")
-        page.get_by_role("dialog").get_by_role("button").filter(has_text = "Voice").first.click()
-        page.wait_for_timeout(600)
+        voice = page.get_by_role("dialog").get_by_role("button").filter(has_text = "Voice").first
+        voice.click()
         page.set_viewport_size({"width": 1440, "height": 480})
-        page.locator("[aria-label='Dictation language']").click()
-        page.wait_for_timeout(700)
-        state = page.evaluate(
-            """
-            () => {
-              const vp = document.querySelector("[data-radix-select-viewport]");
-              return vp
-                ? { scrollable: vp.scrollHeight > vp.clientHeight, top: vp.scrollTop }
-                : null;
-            }
-            """
-        )
-        if not state or not state["scrollable"]:
-            fail(f"select viewport not scrollable: {state}")
-        for _ in range(6):
+        trigger = page.locator("[aria-label='Dictation language']")
+        trigger.wait_for(state = "visible")
+        trigger.click()
+
+        viewport = page.locator("[data-radix-select-viewport]")
+        viewport.wait_for(state = "visible")
+        try:
+            page.wait_for_function(SCROLLABLE_JS, timeout = 10_000)
+        except PWTimeout:
+            fail(f"select viewport not scrollable: {page.evaluate(VIEWPORT_STATE_JS)}")
+
+        # Radix moves focus into the listbox after opening, so early presses can scroll nothing.
+        kb_top = 0
+        for _ in range(40):
             page.keyboard.press("ArrowDown")
-            page.wait_for_timeout(100)
-        kb_top = page.evaluate(
-            "() => document.querySelector('[data-radix-select-viewport]').scrollTop"
-        )
+            kb_top = page.evaluate(SCROLL_TOP_JS)
+            if kb_top > 0:
+                break
+            page.wait_for_timeout(50)
         if not kb_top > 0:
-            fail(f"keyboard did not scroll the select viewport: {kb_top}")
-        vp_box = page.locator("[data-radix-select-viewport]").bounding_box()
-        page.mouse.move(vp_box["x"] + vp_box["width"] / 2, vp_box["y"] + 40)
-        page.mouse.wheel(0, -400)
-        page.wait_for_timeout(300)
-        wheel_top = page.evaluate(
-            "() => document.querySelector('[data-radix-select-viewport]').scrollTop"
+            fail(f"keyboard did not scroll the select viewport after 40 presses: {kb_top}")
+
+        # The keyboard read lands mid-scroll and comes in low; let it settle first.
+        kb_top = settled_scroll_top(page)
+        if not kb_top > 0:
+            fail(f"select viewport returned to the top once the keyboard scroll settled: {kb_top}")
+
+        vp_box = viewport.bounding_box()
+        # A fixed offset can land outside a shorter box and wheel whatever is underneath.
+        page.mouse.move(
+            vp_box["x"] + vp_box["width"] / 2,
+            vp_box["y"] + min(40, vp_box["height"] / 2),
         )
-        if not wheel_top < kb_top:
+        # A single wheel event can be dropped.
+        wheel_top = kb_top
+        for _ in range(5):
+            page.mouse.wheel(0, -400)
+            try:
+                page.wait_for_function(
+                    "top => document.querySelector('[data-radix-select-viewport]').scrollTop < top",
+                    arg = kb_top,
+                    timeout = 2_000,
+                )
+                break
+            except PWTimeout:
+                wheel_top = page.evaluate(SCROLL_TOP_JS)
+        else:
             fail(f"wheel did not scroll the select viewport: {kb_top} -> {wheel_top}")
         page.keyboard.press("Escape")
         page.set_viewport_size({"width": 1440, "height": 900})
-        page.wait_for_timeout(400)
+        try:
+            viewport.wait_for(state = "detached", timeout = 10_000)
+        except PWTimeout:
+            pass
 
         step("cn keeps text-ui-* next to color classes (hub tabs)")
         page.keyboard.press("Escape")
-        page.wait_for_timeout(400)
+        wait_for_no_dialog(page)
         page.goto(f"{BASE}/hub", wait_until = "domcontentloaded")
-        page.wait_for_timeout(2000)
+        tab = page.get_by_role("radio").filter(has_text = "Discover").first
+        tab.wait_for(state = "visible", timeout = 15000)
         open_appearance(page)
-        set_input(page, "UI font size", 12)
+        small = SIZES[0]
+        set_input(page, "UI font size", small)
         page.keyboard.press("Escape")
-        page.wait_for_timeout(400)
+        wait_for_no_dialog(page)
         tab = page.get_by_role("radio").filter(has_text = "Discover").first
         tab.wait_for(state = "visible", timeout = 15000)
         tab_font = tab.evaluate("el => parseFloat(getComputedStyle(el).fontSize)")
-        # text-ui-12p5 at scale 0.75; 16px means twMerge dropped the token.
-        if not near(tab_font, 12.5 * 12 / 16):
+        # The unscaled 12.5px means twMerge dropped the text-ui-12p5 token.
+        if not near(tab_font, 12.5 * small / CSS_BASE):
             fail(f"hub tab font did not scale (twMerge drop?): {tab_font}")
         icon_w = page.evaluate(
             "() => { const el = document.querySelector('.size-icon');"
             " return el ? parseFloat(getComputedStyle(el).width) : null; }"
         )
-        # Standard icons render at the UI font size itself below the
-        # default, so setting 12 gives 12px glyphs.
-        if not near(icon_w, 12):
-            fail(f"size-icon did not match the UI font size below 16: {icon_w}")
+        if not near(icon_w, small):
+            fail(f"size-icon did not match the UI font size below {CSS_BASE}: {icon_w}")
         page.goto(BASE, wait_until = "domcontentloaded")
-        page.wait_for_timeout(1500)
+        wait_for_app(page)
         open_appearance(page)
 
         step("default restores exactly")
         page.get_by_role("dialog").get_by_role("button").filter(has_text = "Appearance").first.click()
-        page.wait_for_timeout(500)
+        page.locator("input[aria-label='UI font size']").wait_for(state = "visible", timeout = 15_000)
         set_input(page, "UI font size", DEFAULT)
         final = measure(page)
         for key in ("root", "navFont", "navLine", "sidebarW"):
@@ -233,6 +347,7 @@ def main():
 
         page.screenshot(path = str(ART / "restored-default.png"))
         browser.close()
+    _watchdog.cancel()
     print("[font-scale] PASS", flush = True)
 
 

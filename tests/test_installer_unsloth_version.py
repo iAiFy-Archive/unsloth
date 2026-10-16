@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from unsloth_pwsh_runner import run_pwsh
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALL_SH = REPO_ROOT / "install.sh"
 INSTALL_PS1 = REPO_ROOT / "install.ps1"
@@ -26,7 +28,7 @@ def _extract(pattern: str, source: str) -> str:
 def test_posix_installer_reports_installed_distribution_version():
     source = INSTALL_SH.read_text(encoding = "utf-8")
     reporter = _extract(
-        r"_installed_package_version=\$\(.*?^fi",
+        r"^_installed_package_version_exit=0.*?^fi.*?^fi",
         source,
     )
     result = subprocess.run(
@@ -55,7 +57,8 @@ def test_windows_version_reporter_uses_distribution_metadata():
         r"    \$installedPackageVersion = .*?^    if .*?^    \} else \{.*?^    \}",
         source,
     )
-    result = subprocess.run(
+    # run_pwsh: a startup abort prints no version line and would read as bad metadata parsing.
+    result = run_pwsh(
         [
             "pwsh",
             "-NoProfile",

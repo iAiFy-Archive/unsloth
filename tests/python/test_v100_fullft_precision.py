@@ -1,18 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Regression tests for full finetuning precision on no-bf16 GPUs (V100/T4).
-
-Full finetuning upcasts trainable weights to float32, so the model dtype is
-float32 (not bfloat16). The SFTTrainer mixed-precision template in
-unsloth/models/rl.py must then:
-  - run the forward pass under float16 autocast for normal models,
-  - keep FORCE_FLOAT32 models (Gemma3, gpt_oss, ...) in pure float32,
-  - never select bf16 on hardware without bf16.
-
-We execute the REAL template block extracted from rl.py source (no heavy unsloth
-import) against mocked inputs. See issue #4082.
-"""
+"""On no-bf16 GPUs, full finetunes use float16 autocast, or pure float32 for FORCE_FLOAT32 models."""
 
 from __future__ import annotations
 
@@ -29,7 +18,7 @@ RL_PY = Path(__file__).resolve().parents[2] / "unsloth" / "models" / "rl.py"
 
 
 def _extract_mixed_precision_code() -> str:
-    lines = RL_PY.read_text().split("\n")
+    lines = RL_PY.read_text(encoding = "utf-8").split("\n")
     try:
         start = next(i for i, l in enumerate(lines) if "mixed_precision = (" in l)
     except StopIteration:
@@ -54,15 +43,11 @@ def _restore(mapping, saved):
 
 
 def _decide(dtype, *, bf16_supported, force_float32, full_finetuning, mixed_precision, fp16, bf16):
-    """Run the template block; return (args.fp16, args.bf16, ACCELERATE_MP, raised).
-
-    Stubs (sys.modules, env vars, torch.cuda.is_bf16_supported) are restored on
-    exit so a decision can't leak into later tests in the same process.
-    """
+    """Runs the real template block; stubs are restored on exit so no decision leaks into later tests."""
     uzu = types.ModuleType("unsloth_zoo.utils")
     uzu._get_dtype = lambda x: x
     uzd = types.ModuleType("unsloth_zoo.device_type")
-    uzd.device_is_bf16_supported = lambda: bf16_supported  # device-aware signal stub
+    uzd.device_is_bf16_supported = lambda: bf16_supported
 
     env_keys = (
         "UNSLOTH_FORCE_FLOAT32",
@@ -103,7 +88,6 @@ def _decide(dtype, *, bf16_supported, force_float32, full_finetuning, mixed_prec
 
 
 def test_v100_normal_fullft_fp16_explicit():
-    # Normal model, full FT (weights upcast to float32), V100, fp16=True.
     fp16, bf16, amp, raised = _decide(
         torch.float32,
         bf16_supported = False,
@@ -114,11 +98,10 @@ def test_v100_normal_fullft_fp16_explicit():
         bf16 = False,
     )
     assert raised is None
-    assert (fp16, bf16) == (True, False)  # float32 weights + fp16 forward
+    assert (fp16, bf16) == (True, False)
 
 
 def test_v100_normal_fullft_precision_unset():
-    # Same, but user left precision unset -> must pick fp16, never bf16.
     fp16, bf16, amp, raised = _decide(
         torch.float32,
         bf16_supported = False,
@@ -134,7 +117,6 @@ def test_v100_normal_fullft_precision_unset():
 
 
 def test_force_float32_model_fullft_is_pure_float32():
-    # FORCE_FLOAT32 model (Gemma3, gpt_oss, ...) in full FT -> pure float32, no autocast.
     fp16, bf16, amp, raised = _decide(
         torch.float32,
         bf16_supported = False,
@@ -150,7 +132,6 @@ def test_force_float32_model_fullft_is_pure_float32():
 
 
 def test_no_bf16_on_volta_in_auto_branch():
-    # bf16 model dtype but no bf16 HW, precision unset -> fp16, never bf16.
     fp16, bf16, amp, raised = _decide(
         torch.bfloat16,
         bf16_supported = False,
@@ -164,8 +145,7 @@ def test_no_bf16_on_volta_in_auto_branch():
 
 
 def test_bf16_gpu_unchanged_auto_branch():
-    # Regression guard: on a bf16 GPU, a float32 model with unset precision
-    # still selects bf16 autocast (behavior must not change for bf16 hardware).
+    # On bf16 hardware a float32 model with unset precision must still pick bf16 autocast.
     fp16, bf16, amp, raised = _decide(
         torch.float32,
         bf16_supported = True,
@@ -180,7 +160,6 @@ def test_bf16_gpu_unchanged_auto_branch():
 
 
 def test_genuine_bf16_model_with_fp16_still_raises():
-    # A real bfloat16 model on bf16 HW with fp16 requested is a genuine mismatch.
     _, _, _, raised = _decide(
         torch.bfloat16,
         bf16_supported = True,
@@ -191,3 +170,65 @@ def test_genuine_bf16_model_with_fp16_still_raises():
         bf16 = False,
     )
     assert raised == "TypeError"
+
+
+def test_explicit_bf16_exports_bf16_env():
+    # Issue #4891: downstream readers default ACCELERATE_MIXED_PRECISION to fp16 when unset,
+    # which crashes GRPO on a bf16 model, so the env var must still be exported.
+    fp16, bf16, amp, raised = _decide(
+        torch.bfloat16,
+        bf16_supported = True,
+        force_float32 = False,
+        full_finetuning = False,
+        mixed_precision = "float32",
+        fp16 = False,
+        bf16 = True,
+    )
+    assert raised is None
+    assert (fp16, bf16) == (False, True)
+    assert amp == "bf16"
+
+
+def test_explicit_fp16_exports_fp16_env():
+    fp16, bf16, amp, raised = _decide(
+        torch.float16,
+        bf16_supported = False,
+        force_float32 = False,
+        full_finetuning = False,
+        mixed_precision = "float32",
+        fp16 = True,
+        bf16 = False,
+    )
+    assert raised is None
+    assert (fp16, bf16) == (True, False)
+    assert amp == "fp16"
+
+
+def test_force_float32_beats_explicit_bf16():
+    fp16, bf16, amp, raised = _decide(
+        torch.float32,
+        bf16_supported = True,
+        force_float32 = True,
+        full_finetuning = False,
+        mixed_precision = "float32",
+        fp16 = False,
+        bf16 = True,
+    )
+    assert raised is None
+    assert (fp16, bf16) == (False, False)
+    assert amp == "no"
+
+
+def test_unsloth_mixed_precision_bfloat16_beats_explicit_bf16():
+    fp16, bf16, amp, raised = _decide(
+        torch.bfloat16,
+        bf16_supported = True,
+        force_float32 = False,
+        full_finetuning = True,
+        mixed_precision = "bfloat16",
+        fp16 = False,
+        bf16 = True,
+    )
+    assert raised is None
+    assert (fp16, bf16) == (False, False)
+    assert amp == "no"

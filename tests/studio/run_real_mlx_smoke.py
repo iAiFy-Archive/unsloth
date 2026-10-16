@@ -1,14 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""End-to-end MLX smoke test on real Apple Silicon (multi-process driver).
-
-`train` overfits gemma-3-270m-it on one row for 30 steps and saves
-lora/merged_16bit/gguf; `reload` reopens each format in a fresh process.
-GGUF + LoRA reload fixes land in unslothai/unsloth-zoo#627. Metal's
-reduction-order nondeterminism makes loss assertions bounds, not exact.
-Apple-Silicon only; invoked from .github/workflows/mlx-ci.yml.
-"""
+"""MLX smoke test on Apple Silicon; loss is checked as bounds, since Metal's reduction order varies."""
 
 from __future__ import annotations
 
@@ -33,11 +26,6 @@ EXPECT_IN_OUTPUT = "Unsloth"
 MODEL_NAME = "unsloth/gemma-3-270m-it"
 
 
-# ---------------------------------------------------------------------------
-# Determinism + telemetry helpers
-# ---------------------------------------------------------------------------
-
-
 def _seed_everything() -> None:
     _random.seed(SEED)
     np.random.seed(SEED)
@@ -51,7 +39,7 @@ def _peak_gpu_gb() -> float:
 
     if not mx.metal.is_available():
         return 0.0
-    # Newer MLX moved get_peak_memory to top-level; fall back to mx.metal.
+    # Newer MLX moved get_peak_memory to top-level.
     getter = getattr(mx, "get_peak_memory", None) or getattr(mx.metal, "get_peak_memory", None)
     if getter is None:
         return 0.0
@@ -97,7 +85,7 @@ class Phase:
             f"peak_gpu={peak_gpu:.2f}GB peak_rss={peak_rss:.2f}GB ===",
             flush = True,
         )
-        return False  # don't swallow exceptions
+        return False
 
 
 def _compute_loss_and_grad_norm(model, tokenizer, text: str) -> tuple[float, float]:
@@ -106,7 +94,7 @@ def _compute_loss_and_grad_norm(model, tokenizer, text: str) -> tuple[float, flo
     import mlx.nn as nn
     from mlx.utils import tree_flatten
 
-    # Match Unsloth's text dataset path: no EOS appended behind the user's back.
+    # Match Unsloth's text dataset path: no EOS appended.
     ids = list(tokenizer.encode(text))
     if len(ids) < 2:
         raise RuntimeError(f"text too short to compute loss: {len(ids)} tokens")
@@ -129,11 +117,7 @@ def _compute_loss_and_grad_norm(model, tokenizer, text: str) -> tuple[float, flo
 
 
 def _teacher_forced_completion_loss(model, tokenizer, prompt: str, completion: str) -> float:
-    """Mean teacher-forced next-token CE on `completion` given `prompt`.
-
-    Decouples the memorisation check from flaky greedy-decode geometry:
-    asserts *what* the model memorised, not just that loss is low.
-    """
+    """Mean next-token CE on completion given prompt; checks memorisation without flaky greedy decoding."""
     import mlx.core as mx
     import mlx.nn as nn
 
@@ -149,7 +133,7 @@ def _teacher_forced_completion_loss(model, tokenizer, prompt: str, completion: s
     targets = mx.array([full_ids[1:]], dtype = mx.int32)
     logits = model(inputs)
 
-    # logits at position i predict targets[i]; completion starts at len(prompt_ids)-1.
+    # logits at position i predict targets[i]; the completion starts at len(prompt_ids)-1.
     start = len(prompt_ids) - 1
     completion_logits = logits[:, start:, :]
     completion_targets = targets[:, start:]
@@ -161,11 +145,6 @@ def _write_metrics(path: Path, metrics: dict) -> None:
     path.write_text(json.dumps(metrics, indent = 2, default = str))
     print(f"\n[metrics] wrote {path}", flush = True)
     print(json.dumps(metrics, indent = 2, default = str), flush = True)
-
-
-# ---------------------------------------------------------------------------
-# `train` subcommand
-# ---------------------------------------------------------------------------
 
 
 def cmd_train(args) -> int:
@@ -203,8 +182,7 @@ def cmd_train(args) -> int:
     mx.random.seed(SEED)
 
     with Phase("apply_lora", metrics):
-        # Full q/k/v/o + gate/up/down set: q/k/v/o alone couldn't memorize
-        # the row, the MLP projections add the needed capacity.
+        # q/k/v/o alone could not memorize the row; the MLP projections add the needed capacity.
         model = FastMLXModel.get_peft_model(
             model,
             r = 8,
@@ -237,15 +215,14 @@ def cmd_train(args) -> int:
         config = MLXTrainingConfig(
             per_device_train_batch_size = 2,
             gradient_accumulation_steps = 3,
-            # PR #5498 sweep: 7 steps too few; 30 makes every seed converge.
+            # 7 steps were too few; 30 makes every seed converge.
             max_steps = 30,
             learning_rate = 1e-3,
             warmup_steps = 0,
             lr_scheduler_type = "constant",
             optim = "adamw",
             weight_decay = 0.0,
-            # Pin the elementwise clip (value=1.0, norm disabled) to match the
-            # 13-seed-tested fixture; explicit value overrides zoo's MLX default.
+            # Elementwise clip (value=1.0, norm disabled) to match the seed-tested fixture.
             max_grad_norm = 0.0,
             max_grad_value = 1.0,
             logging_steps = 1,
@@ -301,7 +278,6 @@ def cmd_train(args) -> int:
         )
         if k in train_result
     }
-    # logging_steps=1 + max_steps=N -> N callbacks; gate auto-follows max_steps.
     expected_logged_steps = int(config.max_steps)
     assert (
         len(losses_per_step) == expected_logged_steps
@@ -311,8 +287,7 @@ def cmd_train(args) -> int:
             f"expected train_steps={expected_logged_steps}, got " f"{train_result['train_steps']}"
         )
     for i, l in enumerate(losses_per_step):
-        # Allow exact 0.0: fp16 loss underflows once the LoRA memorises the
-        # row (~step 10); that's success, so the lower bound is >= 0 not > 0.
+        # fp16 loss can underflow to exactly 0.0 once the row is memorised; that is success.
         assert math.isfinite(l) and 0 <= l < 50, f"step {i+1} loss bad: {l}"
     assert (
         losses_per_step[-1] < losses_per_step[0] * 1.1
@@ -323,8 +298,7 @@ def cmd_train(args) -> int:
     metrics["post_train_loss"] = round(post_loss, 4)
     metrics["post_train_grad_norm"] = round(post_norm, 4)
     assert post_loss < pre_loss, f"post {post_loss} >= pre {pre_loss}"
-    # Memorisation gate: every converging (clip, bc, seed) config in the
-    # 13-seed sweep hit post_train_loss <= 0.05, so 0.1 is a robust bound.
+    # Every converging config in the 13-seed sweep reached <= 0.05.
     assert post_loss < 0.1, (
         f"post_train_loss={post_loss:.4f} >= 0.1 -- training did not "
         "memorise the single training row in 30 steps. Trainer "
@@ -343,8 +317,7 @@ def cmd_train(args) -> int:
             verbose = False,
         )
     metrics["in_memory_generation"] = in_mem_out
-    # Soft greedy-decode metric only (46-77% of seeds): fp16 + MLX generate
-    # noises the first token. The teacher-forced check below is load-bearing.
+    # Soft only: fp16 + MLX greedy decode perturbs the first token. The teacher-forced check gates.
     metrics["in_memory_generation_has_expected"] = EXPECT_IN_OUTPUT in in_mem_out
     if EXPECT_IN_OUTPUT not in in_mem_out:
         print(
@@ -354,9 +327,7 @@ def cmd_train(args) -> int:
             flush = True,
         )
 
-    # Hard check: teacher-forced loss on the trained completion bypasses
-    # greedy-decode fp16 fragility. 13/13 measured configs reached < 1e-3,
-    # so this gate is deterministic across (seed, clip, bc).
+    # Hard check: teacher-forced loss bypasses greedy-decode fp16 fragility.
     completion_loss = _teacher_forced_completion_loss(
         model, tokenizer, PROMPT, EXPECT_IN_OUTPUT + "!"
     )
@@ -369,8 +340,6 @@ def cmd_train(args) -> int:
         "optimizer defaults vs torch.optim.AdamW."
     )
 
-    # unsloth-zoo#627 fixed from_pretrained(lora_dir) so the cold-start
-    # reload below works on the saved adapter dir directly.
     lora_dir = workdir / "lora"
     with Phase("save_lora", metrics):
         model.save_pretrained_merged(
@@ -382,7 +351,6 @@ def cmd_train(args) -> int:
     assert (lora_dir / "adapters.safetensors").exists()
     assert (lora_dir / "adapter_config.json").exists()
 
-    # Save merged_16bit (full HF directory)
     merged_dir = workdir / "merged_16bit"
     with Phase("save_merged_16bit", metrics):
         model.save_pretrained_merged(
@@ -393,20 +361,14 @@ def cmd_train(args) -> int:
     metrics["merged_dir"] = str(merged_dir)
     assert any(merged_dir.glob("*.safetensors"))
 
-    # Save GGUF (best-effort). For some models (e.g. gemma-3-270m-it)
-    # llama.cpp's convert_hf_to_gguf asserts on the tokenizer vocab -- an
-    # llama.cpp limitation, not an unsloth_zoo bug. Soft-skip with a recorded
-    # reason so the LoRA + merged_16bit assertions still gate the PR.
+    # Best-effort: llama.cpp's converter asserts on some tokenizers (e.g. gemma-3-270m-it); soft-skip.
     gguf_dir = workdir / "gguf"
     metrics["gguf_supported"] = False
     metrics["gguf_skip_reason"] = None
     metrics["gguf_dir"] = str(gguf_dir)
     with Phase("save_gguf", metrics):
         try:
-            # q8_0 (the exporter default), not bf16: llama.cpp has optimized q8_0
-            # CPU kernels, whereas bf16 CPU decode is unusably slow on the runner
-            # and made the fresh-process llama-cli reload below time out. q8_0 is
-            # also what users deploy by default.
+            # q8_0, not bf16: bf16 CPU decode in llama.cpp is too slow on the runner.
             model.save_pretrained_gguf(
                 str(gguf_dir),
                 tokenizer = tokenizer,
@@ -435,11 +397,6 @@ def cmd_train(args) -> int:
 
     _write_metrics(workdir / "train_metrics.json", metrics)
     return 0
-
-
-# ---------------------------------------------------------------------------
-# `reload` subcommand (fresh process per format)
-# ---------------------------------------------------------------------------
 
 
 def cmd_reload(args) -> int:
@@ -482,9 +439,7 @@ def cmd_reload(args) -> int:
     metrics["generation"] = out
     print(f"  [reload:{args.format}] output: {out!r}", flush = True)
 
-    # Save/reload invariant: reloaded teacher-forced loss on TRAIN_TEXT must
-    # match the in-memory post_train_loss. Robust to MLX's greedy-decode
-    # perturbation, which can flip the first token but not the loss.
+    # Reloaded teacher-forced loss must match in-memory post_train_loss; immune to first-token flips.
     train_metrics_path = save_dir.parent / "train_metrics.json"
     in_mem_loss = None
     in_mem_out = None
@@ -501,13 +456,12 @@ def cmd_reload(args) -> int:
     if isinstance(in_mem_loss, (int, float)) and math.isfinite(in_mem_loss):
         reload_loss, _ = _compute_loss_and_grad_norm(m, t, TRAIN_TEXT)
         metrics["reload_post_train_loss"] = round(reload_loss, 4)
-        # float16 round-trip is near-exact; 0.2 tolerates dequant noise.
+        # 0.2 tolerates dequant noise.
         assert abs(reload_loss - float(in_mem_loss)) < 0.2, (
             f"reload {args.format!r} loss diverged from in-memory: "
             f"reload={reload_loss:.4f}, in-memory={in_mem_loss:.4f}"
         )
     else:
-        # Fallback when train_metrics.json is missing: gate on non-empty output.
         body = out.replace(PROMPT, "", 1).strip()
         assert len(body) >= 4, (
             f"reload {args.format!r} produced no usable output for " f"{PROMPT!r}: {out!r}"
@@ -520,12 +474,7 @@ def cmd_reload(args) -> int:
 
 
 def _find_llama_cli() -> Path | None:
-    """Locate the llama-cli binary save_pretrained_gguf built.
-
-    save_pretrained_gguf installs llama.cpp under unsloth_zoo's LLAMA_CPP_DEFAULT_DIR
-    ($UNSLOTH_LLAMA_CPP_PATH or ~/.unsloth/llama.cpp), not the working directory, so
-    search there first and keep the CWD-relative layout as a fallback.
-    """
+    """llama.cpp is installed under UNSLOTH_LLAMA_CPP_PATH or ~/.unsloth/llama.cpp, not the CWD."""
     bases: list[Path] = []
     env_dir = os.environ.get("UNSLOTH_LLAMA_CPP_PATH")
     if env_dir:
@@ -545,10 +494,8 @@ def _find_llama_cli() -> Path | None:
         for rel in ("llama-cli", "build/bin/llama-cli"):
             cand = base / rel
             if cand.is_file() and os.access(cand, os.X_OK):
-                # Absolute: a separator-less relative path would send subprocess
-                # to a PATH lookup instead of running the file.
+                # Absolute: a separator-less relative path would trigger a PATH lookup.
                 return cand.resolve()
-        # Last resort: the binary may sit under an unexpected build subdir.
         if base.is_dir():
             for cand in sorted(base.glob("**/llama-cli")):
                 if cand.is_file() and os.access(cand, os.X_OK):
@@ -569,10 +516,7 @@ def _reload_gguf(save_dir: Path, metrics: dict) -> int:
         raise SystemExit(f"no .gguf files in {save_dir}")
     gguf_path = gguf_files[0]
 
-    # Save/reload-integrity smoke (assert below only needs a few chars). The GGUF is
-    # exported q8_0 (see save_gguf) because llama.cpp bf16 CPU decode is unusably slow
-    # on the runner. Run CPU-only (-ngl 0), cap the context (-c 256, the model
-    # advertises 32768), and keep generation short; all env-tunable.
+    # CPU-only, short context and generation keep the q8_0 reload fast; all env-tunable.
     n_predict = os.environ.get("UNSLOTH_GGUF_RELOAD_N", "8")
     n_threads = os.environ.get("UNSLOTH_GGUF_RELOAD_THREADS", str(os.cpu_count() or 4))
     n_ctx = os.environ.get("UNSLOTH_GGUF_RELOAD_CTX", "256")
@@ -627,9 +571,7 @@ def _reload_gguf(save_dir: Path, metrics: dict) -> int:
     print(f"  [reload:gguf] stdout (head):\n{proc.stdout[:800]}", flush = True)
     if proc.returncode != 0:
         raise SystemExit(f"llama-cli exit {proc.returncode}; stderr head: {proc.stderr[:400]}")
-    # llama.cpp tokenises/samples differently than mlx_lm, so the GGUF
-    # completion needn't match. Require non-empty output to catch real
-    # save/reload corruption; record EXPECT_IN_OUTPUT without gating on it.
+    # llama.cpp samples differently than mlx_lm, so record EXPECT_IN_OUTPUT without gating.
     body = (proc.stdout or "").replace(PROMPT, "", 1).strip()
     metrics["gguf_has_expected"] = EXPECT_IN_OUTPUT in (proc.stdout or "")
     assert len(body) >= 4, (
@@ -639,11 +581,6 @@ def _reload_gguf(save_dir: Path, metrics: dict) -> int:
     metrics["final_peak_rss_gb"] = round(_peak_rss_gb(), 3)
     _write_metrics(save_dir.parent / "gguf_reload_metrics.json", metrics)
     return 0
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 
 def main() -> int:

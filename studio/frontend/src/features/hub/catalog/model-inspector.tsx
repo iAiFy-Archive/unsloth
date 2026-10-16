@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { useVllmAvailable, useVllmPlatform } from "@/features/model-picker";
+import { useHfEndpoint, useHubName } from "@/lib/hf-endpoint";
 import {
   Tooltip,
   TooltipContent,
@@ -18,6 +20,7 @@ import {
   formatShortDate,
 } from "@/features/hub/lib/format";
 import { useHfTokenStore } from "@/features/hub/stores/hf-token-store";
+import { taskForMediaPick } from "@/features/model-picker/components/model-selector/audio-picker-policy";
 import { Tick02Icon } from "@/lib/tick-icon";
 import { cn, formatCompact } from "@/lib/utils";
 import {
@@ -29,7 +32,7 @@ import {
   Database02Icon,
   Download01Icon,
   FavouriteIcon,
-  Globe02Icon,
+  InternetIcon,
   LayersLogoIcon,
   LibraryIcon,
   LicenseIcon,
@@ -37,12 +40,20 @@ import {
   RamMemoryIcon,
   Share05Icon,
 } from "@hugeicons/core-free-icons";
+import { TextToSpeechIcon } from "@/lib/hugeicons-derived";
 import type { IconSvgElement } from "@hugeicons/react";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { memo, useDeferredValue, useMemo } from "react";
 import { selectActiveJob, useDownloadManagerStore } from "../download-manager";
 import { useCopyFeedback } from "../hooks/use-copy-feedback";
 import { useDatasetSize } from "../hooks/use-dataset-size";
+import {
+  type HubModelRunSelection,
+  hubModelRunsOnAudioPage,
+  isEmbeddingOnly,
+  isHubModelRunEligible,
+} from "../lib/model-run-selection";
+import { studioPageForTask } from "../lib/unsloth-support";
 import {
   formatLibrary,
   formatLocalUpdated,
@@ -55,16 +66,10 @@ import { DatasetDownloadSection } from "./dataset-download-section";
 import { DownloadSection } from "./download-section";
 import { LocalDatasetCard } from "./local-dataset-card";
 import { LocalOnDeviceCard } from "./local-on-device-card";
+import { modelDownloadState } from "./model-download-state";
 import { ModelReadme } from "./model-readme";
 import { OwnerAvatar } from "./owner-avatar";
 import { AccessChip, CapabilityPill } from "./shared";
-
-// HF pipeline_tag values authoritative for embedding-only repos; capability
-// labels (code/vision/audio) can leak onto them via name or tags.
-const EMBEDDING_PIPELINE_TAGS: ReadonlySet<string> = new Set([
-  "feature-extraction",
-  "sentence-similarity",
-]);
 
 function ViewRepositoryButton({
   repoId,
@@ -74,14 +79,16 @@ function ViewRepositoryButton({
   isDataset: boolean;
 }) {
   const online = useOnlineStatus();
-  const url = `https://huggingface.co/${isDataset ? "datasets/" : ""}${repoId}`;
+  const hfEndpoint = useHfEndpoint();
+  const hubName = useHubName();
+  const url = `${hfEndpoint}/${isDataset ? "datasets/" : ""}${repoId}`;
   const baseClass =
     "inline-flex size-6 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors";
   const icon = (
     <HugeiconsIcon
       icon={Share05Icon}
       strokeWidth={1.75}
-      className="size-[13px]"
+      className="size-[calc(13px*var(--ui-space-scale,1))]"
     />
   );
   return (
@@ -114,7 +121,7 @@ function ViewRepositoryButton({
         )}
       </TooltipTrigger>
       <TooltipContent side="bottom" className="tooltip-compact">
-        {online ? "Open on Hugging Face" : "Unavailable offline"}
+        {online ? `Open on ${hubName}` : "Unavailable offline"}
       </TooltipContent>
     </Tooltip>
   );
@@ -141,7 +148,7 @@ function CopyRepoButton({ repoId }: { repoId: string }) {
           <HugeiconsIcon
             icon={copied ? Tick02Icon : Copy01Icon}
             strokeWidth={1.75}
-            className="size-[13px]"
+            className="size-[calc(13px*var(--ui-space-scale,1))]"
           />
         </button>
       </TooltipTrigger>
@@ -187,7 +194,7 @@ function StatGrid({ children }: { children: React.ReactNode }) {
 }
 
 function InspectorDownloadSlot({ children }: { children: React.ReactNode }) {
-  return <div className="max-w-[680px] pt-3">{children}</div>;
+  return <div className="max-w-[calc(680px*var(--ui-space-scale,1))] pt-3">{children}</div>;
 }
 
 function StatusChip({
@@ -248,12 +255,12 @@ function BaseModelSearchChip({
           <button
             type="button"
             onClick={() => onSearchHub(searchTerm)}
-            className="inline-flex h-6 max-w-full cursor-pointer items-center gap-1.5 rounded-full bg-muted px-2.5 text-ui-11p5 transition-colors hover:bg-muted/80 dark:bg-[rgba(255,255,255,0.04)]"
+            className="inline-flex h-6 max-w-full cursor-pointer items-center gap-1.5 rounded-full bg-muted px-2.5 text-ui-11p5 transition-colors hover:bg-muted/80 dark:bg-[rgb(255_255_255_/_calc(0.04*var(--contrast-wash-gain,1)))]"
           >
             {content}
           </button>
         ) : (
-          <span className="inline-flex h-6 max-w-full items-center gap-1.5 rounded-full bg-muted px-2.5 text-ui-11p5 dark:bg-[rgba(255,255,255,0.04)]">
+          <span className="inline-flex h-6 max-w-full items-center gap-1.5 rounded-full bg-muted px-2.5 text-ui-11p5 dark:bg-[rgb(255_255_255_/_calc(0.04*var(--contrast-wash-gain,1)))]">
             {content}
           </span>
         )}
@@ -280,12 +287,17 @@ function ModelStatusChips({
   unslothSupport: UnslothSupport;
   vramInfo: VramInfo;
 }) {
-  const showUnsupported = !isDataset && unslothSupport.status === "unsupported";
+  // The Images/Video pages run these, so they are not "unsupported" to a user even though chat cannot load them.
+  const showUnsupported =
+    !isDataset &&
+    unslothSupport.status === "unsupported" &&
+    !unslothSupport.supportedIn;
+  const showVllm = !isDataset && unslothSupport.supportedIn === "vllm";
   // The format-unsupported chip already explains itself; this one covers the
   // supported-format model a chat-only host still can't run.
-  const showChatOnly = !isDataset && !isGguf && chatOnly && !showUnsupported;
+  const showChatOnly = !isDataset && !isGguf && chatOnly && !showUnsupported && !showVllm;
   const showVram = !isDataset && vramInfo && !isGguf;
-  if (!showUnsupported && !showChatOnly && !showVram) return null;
+  if (!showUnsupported && !showChatOnly && !showVram && !showVllm) return null;
 
   const vramTone = vramInfo
     ? vramInfo.status === "exceeds"
@@ -332,6 +344,29 @@ function ModelStatusChips({
             <span className="mt-1 block text-ui-10p5 font-normal text-white/75">
               Still downloadable to your Hugging Face cache.
             </span>
+          </TooltipContent>
+        </Tooltip>
+      )}
+      {showVllm && (
+        <Tooltip>
+          <TooltipTrigger asChild={true}>
+            <span tabIndex={0} className="inline-flex outline-none">
+              <StatusChip tone="warning" label="Requires vLLM" />
+            </span>
+          </TooltipTrigger>
+          <TooltipContent
+            side="bottom"
+            sideOffset={6}
+            className="tooltip-compact max-w-xs"
+          >
+            The default engine cannot load this format. After downloading, open
+            it from the chat model picker and choose vLLM as the Inference
+            engine in its run settings.
+            {unslothSupport.reason && (
+              <span className="mt-1 block text-ui-10p5 font-normal text-white/75">
+                {unslothSupport.reason}
+              </span>
+            )}
           </TooltipContent>
         </Tooltip>
       )}
@@ -382,33 +417,34 @@ export type ModelInspectorRuntime = {
   isActive: boolean;
   activeGgufVariant: string | null;
   isLoadingThisModel: boolean;
-  loadingPhase?: "downloading" | "starting";
   minMemory: string | null;
   vramInfo: {
     est: number;
     status: "fits" | "tight" | "exceeds";
   } | null;
   gpuGb?: number;
+  /** GPUs gpuGb sums, for the loader's per-card VRAM reserve. */
+  gpuCount?: number;
   systemRamGb?: number;
 };
 
 export type ModelInspectorActions = {
-  onLoad: (opts: { ggufVariant?: string; expectedBytes?: number }) => void;
-  onLoadLocal: (opts?: {
-    ggufVariant?: string;
-    expectedBytes?: number;
-  }) => void;
-  onUseInChat: () => void;
-  onEject?: () => void;
-  onTrain?: () => void;
   onInventoryChange?: () => void;
   onSearchHub?: (query: string) => void;
+  onRun?: (
+    selection: HubModelRunSelection,
+    mediaPage: ReturnType<typeof studioPageForTask> | "audio",
+  ) => void;
+  runConfigPending?: boolean;
 };
 
 export const ModelInspector = memo(function ModelInspector({
   model,
   runtime,
   actions,
+  preferredGgufFile = null,
+
+  preferredGgufFileIntent = 0,
   isDataset = false,
   metadataUnavailable = false,
   selectionHiddenByFilters = false,
@@ -417,6 +453,8 @@ export const ModelInspector = memo(function ModelInspector({
   isDataset?: boolean;
   metadataUnavailable?: boolean;
   selectionHiddenByFilters?: boolean;
+  preferredGgufFile?: string | null;
+  preferredGgufFileIntent?: number;
   runtime: ModelInspectorRuntime;
   actions: ModelInspectorActions;
 }) {
@@ -424,23 +462,23 @@ export const ModelInspector = memo(function ModelInspector({
     isActive,
     activeGgufVariant,
     isLoadingThisModel,
-    loadingPhase,
     minMemory,
     vramInfo,
     gpuGb,
+    gpuCount,
     systemRamGb,
   } = runtime;
   const {
-    onLoad,
-    onLoadLocal,
-    onUseInChat,
-    onEject,
-    onTrain,
     onInventoryChange,
     onSearchHub,
+    onRun,
+    runConfigPending = false,
   } = actions;
   const deviceType = usePlatformStore((s) => s.deviceType);
   const chatOnly = usePlatformStore((s) => s.isChatOnly());
+  const chatOnlyMeasured = usePlatformStore(
+    (s) => s.isChatOnly() && !s.capabilitiesUnknown(),
+  );
   const hfToken = useHfTokenStore((s) => s.token);
   const datasetRepoId = isDataset && model?.hubRepoId ? model.hubRepoId : null;
   const datasetSize = useDatasetSize(datasetRepoId, {
@@ -474,6 +512,8 @@ export const ModelInspector = memo(function ModelInspector({
   const supportTagsKey = model?.tags?.join("\0") ?? "";
   const supportLibraryName = model?.libraryName;
   const supportQuantMethod = model?.quantMethod;
+  const vllmAvailable = useVllmAvailable();
+  const vllmPlatform = useVllmPlatform();
   const unslothSupport = useMemo<UnslothSupport>(() => {
     return classifyUnslothSupport({
       modelId: supportModelId,
@@ -482,8 +522,12 @@ export const ModelInspector = memo(function ModelInspector({
       libraryName: supportLibraryName,
       deviceType,
       quantMethod: supportQuantMethod,
+      vllmAvailable,
+      vllmPlatform,
     });
   }, [
+    vllmAvailable,
+    vllmPlatform,
     deviceType,
     supportLibraryName,
     supportModelId,
@@ -497,7 +541,7 @@ export const ModelInspector = memo(function ModelInspector({
 
   if (!model) {
     return (
-      <div className="flex min-h-[60vh] flex-col items-center justify-center gap-3 py-16 text-center">
+      <div className="flex min-h-[60dvh] flex-col items-center justify-center gap-3 py-16 text-center">
         <div className="inline-flex size-12 items-center justify-center rounded-[14px] bg-muted text-muted-foreground">
           <HugeiconsIcon icon={CubeIcon} strokeWidth={1.5} className="size-5" />
         </div>
@@ -508,13 +552,14 @@ export const ModelInspector = memo(function ModelInspector({
           <p className="max-w-sm text-ui-12p5 leading-5 text-muted-foreground">
             {isDataset
               ? "Choose a dataset from the catalog to inspect its download state and details."
-              : "Choose an item from the catalog to inspect its runtime fit, download state, and model card."}
+              : "Choose an item from the catalog to inspect its hardware fit, download state, and model card."}
           </p>
         </div>
       </div>
     );
   }
 
+  const downloadState = modelDownloadState(model);
   const updatedRaw = model.updatedAt
     ? formatRelativeShort(model.updatedAt)
     : formatLocalUpdated(model.localUpdatedAt);
@@ -541,35 +586,40 @@ export const ModelInspector = memo(function ModelInspector({
   const paramsLabel = model.totalParams
     ? formatCompact(model.totalParams)
     : "N/A";
-  const unslothSupported = unslothSupport.status !== "unsupported";
-  // Embedding-only non-GGUF repos have no generative head, so keep them out of
-  // the Run gate. Prefer the pipeline tag, else the capability heuristic.
-  const isEmbeddingOnly =
+  // Media models use a separate runtime, so the llama.cpp memory estimate does
+  // not describe their load.
+  const mediaTask = taskForMediaPick(model.pipelineTag, model.task);
+  const mediaPage = studioPageForTask(mediaTask ?? undefined);
+  const audioPage =
+    mediaPage === undefined && hubModelRunsOnAudioPage(model, mediaTask);
+  const runsOnMediaRuntime = mediaPage !== undefined || audioPage;
+  const runEligible = isHubModelRunEligible({
+    model,
+    isDataset,
+    mediaRuntime: runsOnMediaRuntime,
+    nonGgufRuntimeAvailable:
+      !chatOnlyMeasured && unslothSupport.status !== "unsupported",
+  });
+  const runAction =
+    runEligible && onRun
+      ? (selection: HubModelRunSelection) =>
+          onRun(selection, audioPage ? "audio" : mediaPage)
+      : undefined;
+  // A precision folder downloads as it loads, so it need not be on device.
+  const isMlx =
     !model.isGguf &&
-    model.capabilities.some((c) => c.key === "embedding") &&
-    (EMBEDDING_PIPELINE_TAGS.has(model.pipelineTag?.toLowerCase() ?? "") ||
-      !model.capabilities.some(
-        (c) =>
-          c.key === "conversational" ||
-          c.key === "tools" ||
-          c.key === "reasoning" ||
-          c.key === "code" ||
-          c.key === "vision" ||
-          c.key === "audio",
-      ));
-  // Chat-only hosts (no supported GPU / usable MLX) run inference only through
-  // llama.cpp, so only GGUF is loadable.
-  const canRunModel =
+    (model.libraryName?.toLowerCase() === "mlx" ||
+      Boolean(model.tags?.some((tag) => tag.toLowerCase() === "mlx")));
+  const precisionRunAction =
+    isMlx &&
+    onRun &&
     !isDataset &&
-    (model.runtimeCapabilities?.canChat ?? true) &&
-    !isEmbeddingOnly &&
-    (model.isGguf || (!chatOnly && unslothSupported));
-  const canTrainModel =
-    !isDataset &&
-    (model.runtimeCapabilities?.canTrain ?? false) &&
-    model.modelFormat !== "gguf" &&
-    model.modelFormat !== "adapter" &&
-    unslothSupported;
+    !isEmbeddingOnly(model) &&
+    !runsOnMediaRuntime &&
+    !chatOnlyMeasured &&
+    unslothSupport.status !== "unsupported"
+      ? (selection: HubModelRunSelection) => onRun(selection, mediaPage)
+      : undefined;
 
   const languages = parseLanguageTags(model.tags);
   const datasetSizeBytes =
@@ -582,7 +632,7 @@ export const ModelInspector = memo(function ModelInspector({
           <OwnerAvatar
             owner={model.owner}
             repoName={model.title}
-            className="size-[60px] rounded-[18px] text-ui-19"
+            className="size-[calc(60px*var(--ui-space-scale,1))] rounded-[18px] text-ui-19"
           />
           <div className="min-w-0 flex-1">
             <div className="flex min-w-0 items-center gap-1.5">
@@ -604,7 +654,7 @@ export const ModelInspector = memo(function ModelInspector({
               {model.owner.toLowerCase() === "unsloth" && (
                 <span
                   aria-label="Verified Unsloth"
-                  className="hub-verified-badge size-[18px] shrink-0 text-verified"
+                  className="hub-verified-badge size-[calc(18px*var(--ui-space-scale,1))] shrink-0 text-verified"
                 />
               )}
             </div>
@@ -618,9 +668,14 @@ export const ModelInspector = memo(function ModelInspector({
             </span>
           )}
           {!isDataset && (
-            <span className="inline-flex h-6 items-center gap-1.5 rounded-full bg-muted px-2.5 text-ui-11p5 font-medium text-foreground dark:bg-[rgba(255,255,255,0.04)]">
+            <span className="inline-flex h-6 items-center gap-1.5 rounded-full bg-muted px-2.5 text-ui-11p5 font-medium text-foreground dark:bg-[rgb(255_255_255_/_calc(0.04*var(--contrast-wash-gain,1)))]">
               <HugeiconsIcon
-                icon={CubeIcon}
+                icon={
+                  model.pipelineTag === "text-to-speech" ||
+                  model.pipelineTag === "text-to-audio"
+                    ? TextToSpeechIcon
+                    : CubeIcon
+                }
                 strokeWidth={1.75}
                 className="size-3 text-muted-foreground"
               />
@@ -648,12 +703,9 @@ export const ModelInspector = memo(function ModelInspector({
           <InspectorDownloadSlot>
             <DatasetDownloadSection
               repoId={model.hubRepoId}
-              isDownloaded={model.isDownloaded}
-              isPartial={model.isPartial ?? false}
-              partialTransport={model.partialTransport ?? null}
+              {...downloadState}
               cachePath={model.path}
               knownBytes={model.cachedBytes}
-              onTrain={onTrain}
               onChange={onInventoryChange}
             />
           </InspectorDownloadSlot>
@@ -664,7 +716,6 @@ export const ModelInspector = memo(function ModelInspector({
             sourceLabel={model.sourceLabel}
             source={model.localSource ?? "custom"}
             path={model.path}
-            onTrain={onTrain}
           />
         </InspectorDownloadSlot>
       )}
@@ -672,7 +723,9 @@ export const ModelInspector = memo(function ModelInspector({
         <InspectorDownloadSlot>
           {model.isLocal && !hasActiveHubDownload ? (
             <LocalOnDeviceCard
+              showMemoryBar={!runsOnMediaRuntime}
               modelId={model.id}
+              displayName={model.title}
               repoId={model.hubRepoId}
               sourceLabel={model.sourceLabel}
               source={model.localSource ?? "custom"}
@@ -686,49 +739,49 @@ export const ModelInspector = memo(function ModelInspector({
               baseModelSummary={model.baseModelSummary}
               adapterType={model.adapterType}
               trainingMethod={model.trainingMethod}
-              canRun={canRunModel}
               isActive={isActive}
               activeGgufVariant={activeGgufVariant}
               isLoading={isLoadingThisModel}
-              loadingPhase={loadingPhase}
               gpuGb={gpuGb}
+              gpuCount={gpuCount}
               systemRamGb={systemRamGb}
+              preferredFile={preferredGgufFile}
+              preferredFileIntent={preferredGgufFileIntent}
               unsupportedReason={
-                unslothSupport.status === "unsupported"
+                unslothSupport.status === "unsupported" &&
+                !unslothSupport.supportedIn
                   ? (unslothSupport.reason ?? "Unsupported format")
                   : null
               }
-              onLoad={onLoadLocal}
-              onUseInChat={onUseInChat}
-              onEject={onEject}
-              onTrain={
-                model.isDownloaded && canTrainModel ? onTrain : undefined
-              }
+              onRun={runAction}
+              runPending={runConfigPending}
               onChange={onInventoryChange}
             />
           ) : (
             <DownloadSection
+              showMemoryBar={!runsOnMediaRuntime}
+              mediaPage={mediaPage}
+              assetRuntime={mediaPage ?? (["text-to-speech", "text-to-audio"].includes(model.pipelineTag ?? model.task ?? "") ? "audio" : undefined)}
               repoId={model.isLocal ? (model.hubRepoId ?? model.id) : model.id}
               isGguf={model.isGguf}
-              isDownloaded={model.isDownloaded}
-              isPartial={model.isPartial ?? false}
-              partialTransport={model.partialTransport ?? null}
+              {...downloadState}
+              companionPrefetch={model.companionPrefetch === true}
               modelFormat={model.modelFormat}
-              canRun={canRunModel}
               isActive={isActive}
               activeQuant={isActive ? (activeGgufVariant ?? null) : null}
+              preferredGgufFile={preferredGgufFile}
+              preferredGgufFileIntent={preferredGgufFileIntent}
               isLoadingThisModel={isLoadingThisModel}
               gpuGb={gpuGb}
+              gpuCount={gpuCount}
               systemRamGb={systemRamGb}
               cachePath={model.path}
               knownBytes={model.cachedBytes}
-              onLoad={model.isLocal ? onLoadLocal : onLoad}
-              onUseInChat={onUseInChat}
-              onEject={onEject}
-              onTrain={
-                model.isDownloaded && canTrainModel ? onTrain : undefined
-              }
+              onRun={runAction}
+              runPending={runConfigPending}
               onChange={onInventoryChange}
+              isMlx={isMlx}
+              onRunPrecision={precisionRunAction}
             />
           )}
         </InspectorDownloadSlot>
@@ -816,7 +869,7 @@ export const ModelInspector = memo(function ModelInspector({
                   ? `${languages.slice(0, 3).join(", ")} +${languages.length - 3}`
                   : languages.join(", ")
               }
-              icon={Globe02Icon}
+              icon={InternetIcon}
             />
           )}
           <StatRow label="License" value={licenseLabel} icon={LicenseIcon} />
@@ -830,7 +883,7 @@ export const ModelInspector = memo(function ModelInspector({
         />
       </div>
 
-      <div className="max-w-[860px] space-y-4 pt-4">
+      <div className="max-w-[var(--hub-readme-measure)] space-y-4 pt-4">
         {readmeReady && readmeRepoId && (
           <ModelReadme
             repoId={readmeRepoId}

@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from unsloth_pwsh_runner import run_pwsh
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALL_SH = REPO_ROOT / "install.sh"
 INSTALL_PS1 = REPO_ROOT / "install.ps1"
@@ -90,7 +92,8 @@ def test_windows_skip_autostart_value_parsing_with_no_torch(value: str, expected
     env = os.environ.copy()
     env["UNSLOTH_NO_TORCH"] = "1"
     env["UNSLOTH_SKIP_AUTOSTART"] = value
-    result = subprocess.run(
+    # run_pwsh: a pwsh killed at startup would read as the parser answering wrongly.
+    result = run_pwsh(
         [
             "pwsh",
             "-NoProfile",
@@ -122,7 +125,8 @@ def test_windows_skip_autostart_bypasses_only_the_interactive_prompt():
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason = "PowerShell is unavailable")
 def test_windows_installer_invalid_package_fails():
-    result = subprocess.run(
+    # run_pwsh: a startup abort also exits non-zero and would read as a rejected package name.
+    result = run_pwsh(
         [
             "pwsh",
             "-NoProfile",

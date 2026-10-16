@@ -21,39 +21,50 @@ import {
 import { Progress } from "@/components/ui/progress";
 import { usePlatformStore } from "@/config/env";
 import { MLX_OPTIMIZER_OPTIONS, OPTIMIZER_OPTIONS } from "@/config/training";
+import { useIsAccountOwner } from "@/features/auth";
 import { setTrainingCompareHandoff } from "@/features/chat";
 import {
+  updateSystemOneSettings,
+  useSettingsDialogStore,
+} from "@/features/settings";
+import {
+  getTrainingMethodLabel,
+  type TrainingViewData,
+  useDuplicateTrainingRun,
   useTrainingActions,
   useTrainingConfigStore,
   useTrainingRuntimeStore,
 } from "@/features/training";
-import { getTrainingMethodLabel } from "@/features/training/lib/training-methods";
-import type { TrainingViewData } from "@/features/training";
-import type { RunConfigOverride } from "./run-config-override";
 import { useGpuUtilization } from "@/hooks";
 import type { GpuUtilization } from "@/hooks/use-gpu-utilization";
+import { type TranslationKey, useT } from "@/i18n";
+import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import {
+  Alert02Icon,
   ChartAverageIcon,
   DashboardSpeed01Icon,
   FolderExportIcon,
   Notebook01Icon,
   RamMemoryIcon,
   StopIcon,
+  TaskDone01Icon,
   TemperatureIcon,
   ZapIcon,
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { type ReactElement, type ReactNode, useEffect, useState } from "react";
+import { type ReactElement, type ReactNode, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { ChartSettingsSheet } from "./charts/chart-settings-sheet";
 import {
   formatDuration,
   formatNumber,
   phaseColors,
+  sessionEtaSeconds,
+  sessionStepsPerSecond,
 } from "./progress-section-lib";
-import { useT, type TranslationKey } from "@/i18n";
+import type { RunConfigOverride } from "./run-config-override";
 
 type ConfigGroup = {
   section: string;
@@ -68,6 +79,8 @@ const phaseLabelKeys = {
   loading_dataset: "studio.progress.phase.loadingDataset",
   configuring: "studio.progress.phase.configuring",
   training: "studio.progress.phase.training",
+  finalizing: "studio.progress.phase.finalizing",
+  training_drafter: "studio.progress.phase.trainingDrafter",
   completed: "studio.progress.phase.completed",
   error: "studio.progress.phase.error",
   stopped: "studio.progress.phase.stopped",
@@ -84,16 +97,19 @@ interface ProgressSectionProps {
   data: TrainingViewData;
   isHistorical?: boolean;
   configOverride?: RunConfigOverride;
+  runId?: string | null;
 }
 
 export function ProgressSection({
   data,
   isHistorical = false,
   configOverride,
+  runId,
 }: ProgressSectionProps): ReactElement {
   const t = useT();
   const navigate = useNavigate();
   const platformDeviceType = usePlatformStore((s) => s.deviceType);
+  const isOwner = useIsAccountOwner();
   const trainingMethodLabel = getTrainingMethodLabel(data.trainingMethod);
 
   const config = useTrainingConfigStore(
@@ -114,6 +130,7 @@ export function ProgressSection({
 
   const [stopDialogOpen, setStopDialogOpen] = useState(false);
   const [stopRequestedLocal, setStopRequestedLocal] = useState(false);
+  const [enablingDecisionApi, setEnablingDecisionApi] = useState(false);
 
   const stopRequested = data.isTrainingRunning && stopRequestedLocal;
 
@@ -129,35 +146,67 @@ export function ProgressSection({
       : Math.round(data.progressPercent);
 
   const elapsed = data.elapsedSeconds;
+  const sessionStartStep = data.sessionStartStep ?? 0;
   const derivedEta =
-    elapsed != null && pct > 0
-      ? Math.round((elapsed * (100 - pct)) / Math.max(pct, 1))
-      : null;
+    sessionStartStep > 0
+      ? sessionEtaSeconds(
+        data.currentStep,
+        sessionStartStep,
+        data.totalSteps,
+        elapsed,
+      )
+      : elapsed != null && pct > 0
+        ? Math.round((elapsed * (100 - pct)) / Math.max(pct, 1))
+        : null;
   const eta = data.etaSeconds ?? derivedEta;
 
-  const stepsPerSecond =
-    elapsed != null && elapsed > 0 ? data.currentStep / elapsed : null;
+  const stepsPerSecond = sessionStepsPerSecond(
+    data.currentStep,
+    sessionStartStep,
+    elapsed,
+  );
   const showHalfwayHint =
     data.phase === "training" && pct >= 50 && pct < 100;
-  const showCompletedHint = data.phase === "completed";
+  const showCompletedHint = data.phase === "completed" && !data.isDecision;
   const handleCompareInChat = async () => {
-    setTrainingCompareHandoff(data.modelName);
+    setTrainingCompareHandoff(data.modelName, data.outputDir);
     await navigate({ to: "/chat" });
   };
 
-  // A finished run can be exported to GGUF: deep-link to the Export page with
-  // this run preselected (its output-dir basename is the export model name).
+  // A finished run can be exported to GGUF: deep-link to Export with this run preselected.
   const exportRunName = data.outputDir
     ? (data.outputDir.replace(/[/\\]+$/, "").split(/[/\\]/).pop() || null)
     : null;
-  const canExportGguf =
+  const hasFinishedOutput =
     !data.isTrainingRunning &&
     !!exportRunName &&
     !data.resumedLater &&
     (data.phase === "completed" || data.phase === "stopped");
+  const canExportGguf = hasFinishedOutput && !data.isDecision;
+  const canUseInDecisionApi = hasFinishedOutput && !!data.isDecision && isOwner;
   const handleExportGguf = () => {
     if (!exportRunName) return;
     void navigate({ to: "/export", search: { run: exportRunName } });
+  };
+  const handleUseInDecisionApi = async () => {
+    if (!exportRunName) {
+      return;
+    }
+    setEnablingDecisionApi(true);
+    try {
+      const model = `laya-ft:${exportRunName}`;
+      await updateSystemOneSettings({ enabled: true, model });
+      useSettingsDialogStore.getState().openDecisionTry(model);
+      toast.success(
+        t("studio.progress.decisionApiEnabled", { name: exportRunName }),
+      );
+    } catch (error) {
+      toast.error(t("studio.progress.decisionApiFailed"), {
+        description: error instanceof Error ? error.message : undefined,
+      });
+    } finally {
+      setEnablingDecisionApi(false);
+    }
   };
 
   const stoppedLoss = getDisplayMetric(
@@ -174,8 +223,7 @@ export function ProgressSection({
     ? data.currentGradNorm
     : (lastValue(data.gradNormHistory) ?? data.currentGradNorm);
 
-  // Prefer the run's saved snapshot when present (#6853). Live falls back to the
-  // editable form store until it loads; History shows blanks, never live form values.
+  // Prefer the run's saved snapshot when present (#6853); History shows blanks, never form values.
   const cfg = configOverride ?? (isHistorical ? undefined : config);
   const cfgEpochs = cfg?.epochs;
   const cfgBatchSize = cfg?.batchSize;
@@ -189,8 +237,7 @@ export function ProgressSection({
   const cfgLoraDropout = cfg?.loraDropout;
   const cfgLoraVariant = cfg?.loraVariant;
 
-  // Mirror the training form: on Mac the MLX backend runs CUDA optimizers as
-  // AdamW, so label them AdamW here too.
+  // Mirror the training form: on Mac the MLX backend runs CUDA optimizers as AdamW.
   const effectiveOptimizer =
     platformDeviceType === "mac" &&
     OPTIMIZER_OPTIONS.some((o) => o.value === cfgOptimizerType)
@@ -208,9 +255,13 @@ export function ProgressSection({
         configRow(t("studio.progress.epochs"), cfgEpochs),
         configRow(t("studio.progress.batchSize"), cfgBatchSize),
         configRow(t("studio.progress.learningRate"), cfgLearningRate),
-        configRow(t("studio.progress.optimizer"), optimizerLabel),
+        ...(data.isDecision
+          ? []
+          : [configRow(t("studio.progress.optimizer"), optimizerLabel)]),
         configRow(t("studio.progress.maxSteps"), cfgMaxSteps),
-        configRow(t("studio.progress.contextLength"), cfgContextLength),
+        ...(data.isDecision
+          ? []
+          : [configRow(t("studio.progress.contextLength"), cfgContextLength)]),
         configRow(t("studio.progress.warmupSteps"), cfgWarmupSteps),
       ],
     },
@@ -222,7 +273,9 @@ export function ProgressSection({
             configRow(t("studio.progress.rank"), cfgLoraRank),
             configRow(t("studio.progress.alpha"), cfgLoraAlpha),
             configRow(t("studio.progress.dropout"), cfgLoraDropout),
-            configRow(t("studio.progress.variant"), cfgLoraVariant),
+            ...(data.isDecision
+              ? []
+              : [configRow(t("studio.progress.variant"), cfgLoraVariant)]),
           ],
         },
       ]
@@ -249,10 +302,23 @@ export function ProgressSection({
               {t("studio.progress.exportGguf")}
             </Button>
           )}
+          {canUseInDecisionApi && (
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-8 gap-1.5 text-xs"
+              disabled={enablingDecisionApi}
+              onClick={handleUseInDecisionApi}
+            >
+              <HugeiconsIcon icon={TaskDone01Icon} className="size-3.5" />
+              {t("studio.progress.useInDecisionApi")}
+            </Button>
+          )}
           {isHistorical ? (
-            <ConfigPopoverButton configItems={configItems} />
+            <ConfigPopoverButton configItems={configItems} runId={runId} />
           ) : (
             <LiveTrainingHeaderActions
+              runId={runId}
               configItems={configItems}
               isTrainingRunning={data.isTrainingRunning}
               onOpenStopDialog={setStopDialogOpen}
@@ -297,7 +363,7 @@ export function ProgressSection({
               </span>
               <span>{pct}%</span>
             </div>
-            <Progress value={pct} className="h-2 bg-foreground/5" />
+            <Progress value={pct} className="h-2 bg-[color-mix(in_oklab,var(--foreground)_calc(5%*var(--contrast-wash-gain,1)),transparent)]" />
           </div>
 
           {!isHistorical && (
@@ -312,6 +378,25 @@ export function ProgressSection({
             <p className="rounded-2xl border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-red-500 leading-relaxed">
               {data.error}
             </p>
+          )}
+
+          {data.warnings.length > 0 && (
+            <div
+              aria-live="polite"
+              className="flex gap-2 rounded-2xl border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs leading-relaxed text-amber-700 dark:text-amber-300"
+            >
+              <HugeiconsIcon
+                icon={Alert02Icon}
+                className="mt-0.5 size-4 shrink-0"
+              />
+              <ul className="min-w-0 space-y-1">
+                {data.warnings.map((warning) => (
+                  <li key={warning} className="break-words">
+                    {warning}
+                  </li>
+                ))}
+              </ul>
+            </div>
           )}
 
           <div
@@ -384,14 +469,9 @@ function LiveGpuPanel({
         ? [gpuData]
         : [];
 
-  useEffect(() => {
-    if (selectedGpu > 0 && selectedGpu >= gpus.length) {
-      setSelectedGpu(0);
-    }
-  }, [gpus.length, selectedGpu]);
-
   const gpuCount = gpus.length;
-  const currentGpu: Partial<GpuUtilization> = gpus[selectedGpu] || gpus[0] || {};
+  const selectedGpuIndex = selectedGpu >= 0 && selectedGpu < gpuCount ? selectedGpu : 0;
+  const currentGpu: Partial<GpuUtilization> = gpus[selectedGpuIndex] || {};
 
   return (
     <div className="flex flex-col gap-3">
@@ -402,9 +482,11 @@ function LiveGpuPanel({
           </p>
           {gpuCount > 1 && (
             <select
-              value={selectedGpu}
+              value={selectedGpuIndex}
               onChange={(e) => setSelectedGpu(Number(e.target.value))}
-              className="h-6 cursor-pointer rounded-md border border-border bg-popover px-1.5 py-0.5 text-ui-11 text-popover-foreground outline-none hover:bg-muted focus:border-ring transition-colors font-medium appearance-none"
+              // At the 16px coarse-pointer floor a 24px box clips descenders, and a long
+              // device name widens the row past the viewport.
+              className="h-6 cursor-pointer rounded-md border border-border bg-popover px-1.5 py-0.5 text-ui-11 text-popover-foreground outline-none hover:bg-muted focus:border-ring transition-colors font-medium appearance-none pointer-coarse:h-auto pointer-coarse:min-w-0 pointer-coarse:max-w-full"
               title="Select GPU"
             >
               {gpus.map((device, index) => (
@@ -471,6 +553,7 @@ function LiveGpuPanel({
 }
 
 function LiveTrainingHeaderActions({
+  runId,
   configItems,
   isTrainingRunning,
   onOpenStopDialog,
@@ -478,6 +561,7 @@ function LiveTrainingHeaderActions({
   stopRequested,
   onSetStopRequested,
 }: {
+  runId?: string | null;
   configItems: ConfigGroup[];
   isTrainingRunning: boolean;
   onOpenStopDialog: (open: boolean) => void;
@@ -503,6 +587,7 @@ function LiveTrainingHeaderActions({
 
   return (
     <TrainingHeaderActions
+      runId={runId}
       configItems={configItems}
       isTrainingRunning={isTrainingRunning}
       onOpenStopDialog={onOpenStopDialog}
@@ -514,11 +599,14 @@ function LiveTrainingHeaderActions({
 }
 
 function ConfigPopoverButton({
+  runId,
   configItems,
 }: {
+  runId?: string | null;
   configItems: ConfigGroup[];
 }): ReactElement {
   const t = useT();
+  const { duplicate, disabled } = useDuplicateTrainingRun();
   return (
     <Popover>
       <PopoverTrigger asChild={true}>
@@ -550,6 +638,16 @@ function ConfigPopoverButton({
               ))}
             </div>
           ))}
+          {runId && (
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={disabled}
+              onClick={() => void duplicate(runId)}
+            >
+              {t("common.duplicate")}
+            </Button>
+          )}
         </div>
       </PopoverContent>
     </Popover>
@@ -557,6 +655,7 @@ function ConfigPopoverButton({
 }
 
 function TrainingHeaderActions({
+  runId,
   configItems,
   isTrainingRunning,
   onOpenStopDialog,
@@ -564,6 +663,7 @@ function TrainingHeaderActions({
   stopDialogOpen,
   stopRequested,
 }: {
+  runId?: string | null;
   configItems: ConfigGroup[];
   isTrainingRunning: boolean;
   onOpenStopDialog: (open: boolean) => void;
@@ -574,7 +674,7 @@ function TrainingHeaderActions({
   const t = useT();
   return (
     <div className="flex items-center gap-2">
-      <ConfigPopoverButton configItems={configItems} />
+      <ConfigPopoverButton configItems={configItems} runId={runId} />
       <ChartSettingsSheet />
       <AlertDialog open={stopDialogOpen} onOpenChange={onOpenStopDialog}>
         <Button
@@ -593,7 +693,7 @@ function TrainingHeaderActions({
         </Button>
         <AlertDialogContent
           className="w-max max-w-[95vw]"
-          overlayClassName="bg-background/40 supports-backdrop-filter:backdrop-blur-[1px]"
+          overlayClassName="bg-background/40"
         >
           <AlertDialogHeader>
             <AlertDialogTitle>{t("studio.training.stopTitle")}</AlertDialogTitle>

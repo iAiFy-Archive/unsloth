@@ -9,11 +9,11 @@ import textwrap
 
 import pytest
 
-# Locate source files relative to this test.
-_TESTS_DIR = pathlib.Path(__file__).resolve().parent.parent  # tests/
-_REPO_ROOT = _TESTS_DIR.parent  # unsloth/
+_TESTS_DIR = pathlib.Path(__file__).resolve().parent.parent
+_REPO_ROOT = _TESTS_DIR.parent
 _INSTALL_SH = _REPO_ROOT / "install.sh"
 _INSTALL_PS1 = _REPO_ROOT / "install.ps1"
+_SETUP_SH = _REPO_ROOT / "studio" / "setup.sh"
 _SETUP_PS1 = _REPO_ROOT / "studio" / "setup.ps1"
 _NO_TORCH_RT = _REPO_ROOT / "studio" / "backend" / "requirements" / "no-torch-runtime.txt"
 
@@ -31,7 +31,6 @@ def _lines(path: pathlib.Path) -> list[str]:
     ]
 
 
-# Group 1 -- Structural checks (no network, instant)
 class TestStructuralTokenizers:
     """Verify tokenizers presence and ordering in no-torch-runtime.txt."""
 
@@ -64,39 +63,46 @@ class TestStructuralTorchConstraint:
     _sh = _read(_INSTALL_SH)
 
     def test_default_assignment_exists(self):
-        assert 'TORCH_CONSTRAINT="torch>=2.4,<2.11.0"' in self._sh
+        """The default range composes the per-file ceiling variable, so the
+        supported line (torch 2.11 today) is bumped in one place."""
+        assert '_TORCH_CEILING="2.12.0"' in self._sh
+        assert 'TORCH_CONSTRAINT="torch>=2.4,<${_TORCH_CEILING}"' in self._sh
 
     def test_tightened_assignment_exists(self):
-        assert 'TORCH_CONSTRAINT="torch>=2.6,<2.11.0"' in self._sh
+        assert 'TORCH_CONSTRAINT="torch>=2.6,<${_TORCH_CEILING}"' in self._sh
 
-    def test_cuda_constraint_widened_to_2_12(self):
-        """A fresh CUDA install widens the ceiling to <2.12.0 so cu12x/cu13x
-        land torch 2.11.x (matches the base image and _CUDA_TORCH_PKG_SPEC);
-        without it cu128/cu130 resolves torch 2.10.x."""
-        assert 'TORCH_CONSTRAINT="torch>=2.4,<2.12.0"' in self._sh
-
-    def test_cuda_case_widens_via_index_leaf(self):
-        """The cu* branch of the _torch_index_leaf case sets the widened
-        constraint (parallel to rocm7.2), anchored on the leaf."""
-        m = re.search(
-            r'cu\[0-9\]\*\)\s*TORCH_CONSTRAINT="torch>=2\.4,<2\.12\.0"',
-            self._sh,
-        )
-        assert m is not None, "CUDA (cu*) TORCH_CONSTRAINT widening case not found"
+    def test_companion_ceilings_composed(self):
+        """Companions bound to the same window via their own ceiling vars."""
+        assert '_TORCHVISION_CEILING="0.27.0"' in self._sh
+        assert '_TORCHAUDIO_CEILING="2.12.0"' in self._sh
+        assert 'TORCHVISION_CONSTRAINT="torchvision>=0.19,<${_TORCHVISION_CEILING}"' in self._sh
+        assert 'TORCHAUDIO_CONSTRAINT="torchaudio>=2.4,<${_TORCHAUDIO_CEILING}"' in self._sh
 
     def test_variable_used_in_pip_install(self):
         """$TORCH_CONSTRAINT must appear in a uv pip install line."""
         assert '"$TORCH_CONSTRAINT"' in self._sh
 
-    def test_hardcoded_torch_constraint_only_once(self):
-        """The hard-coded torch>=2.4,<2.11.0 string should appear exactly once
-        in install.sh (the default assignment), not in pip install lines."""
-        count = self._sh.count('"torch>=2.4,<2.11.0"')
-        assert count == 1, f"Expected 1, found {count}"
+    def test_hardcoded_torch_constraint_only_on_assignments(self):
+        """Hard-coded torch ranges belong only in curated TORCH_CONSTRAINT overrides, never on
+        pip/uv lines."""
+        for literal in ('"torch>=2.4,<2.11.0"', '"torch>=2.4,<2.12.0"'):
+            for ln in self._sh.splitlines():
+                if literal not in ln:
+                    continue
+                assert (
+                    "TORCH_CONSTRAINT=" in ln
+                ), f"{literal} hardcoded off a TORCH_CONSTRAINT= assignment: {ln.strip()!r}"
+                assert (
+                    "pip install" not in ln
+                ), f"{literal} hardcoded on a pip install line: {ln.strip()!r}"
+
+    def test_gfx906_reroute_caps_below_211(self):
+        """The gfx906 / MI50 reroute must keep its literal sub-2.11 cap: the
+        rocm6.3 index it routes to serves no torch 2.11 wheel."""
+        assert self._sh.count('TORCH_CONSTRAINT="torch>=2.4,<2.11.0"') == 1
 
     def test_tightening_guarded_by_skip_torch(self):
         """The block must check SKIP_TORCH=false."""
-        # Find the tightening if-block
         m = re.search(
             r"if\s.*SKIP_TORCH.*=\s*false.*&&.*OS.*=.*macos.*&&.*_ARCH.*=.*arm64",
             self._sh,
@@ -122,7 +128,7 @@ class TestStructuralInstallPs1Unchanged:
         assert "$TorchConstraint" not in self._ps1
 
     def test_hardcoded_torch_constraint_present(self):
-        assert '"torch>=2.4,<2.11.0"' in self._ps1
+        assert '"torch>=2.4,<2.12.0"' in self._ps1
 
 
 class TestInstallPs1UvDefaultIndex:
@@ -153,8 +159,26 @@ class TestSetupPs1FastInstallIndex:
     def test_fast_install_clears_all_uv_index_env_vars(self):
         for var in ("UV_DEFAULT_INDEX", "UV_INDEX_URL", "UV_INDEX", "UV_EXTRA_INDEX_URL"):
             assert var in self._ps1
-        # Must truly remove the vars (child sees no value), not set them empty.
         assert 'Remove-Item "Env:$n"' in self._ps1
+
+
+def test_setup_sh_sidecar_installs_isolate_uv_override():
+    source = _read(_SETUP_SH)
+    helper = re.search(r"fast_install_sidecar\(\) \(\n.*?\n\)", source, re.S)
+    assert helper is not None
+    script = (
+        "UV_OVERRIDE=base\nfast_install() { printf 'child=%s\\n' \"${UV_OVERRIDE-unset}\"; }\n"
+        f"{helper.group()}\nfast_install_sidecar\nprintf 'parent=%s\\n' \"$UV_OVERRIDE\"\n"
+    )
+    result = subprocess.run(["bash", "-c", script], capture_output = True, text = True)
+    assert result.returncode == 0 and result.stdout.splitlines() == ["child=unset", "parent=base"]
+    sidecars = source.split("# ── 6b.", 1)[1].split("# ── GPU detection", 1)[0]
+    # 4 = transformers, the $_SIDECAR_COMMON_PINS loop, tiktoken, and the top-up reinstall.
+    # Every sidecar install must go through the UV_OVERRIDE-clearing wrapper.
+    assert sidecars.count("fast_install_sidecar --target") == 4
+    assert sidecars.count('_install_sidecar "$VENV_T5_') == 3
+    assert sidecars.count('_sidecar_top_up_tiktoken "$VENV_T5_') == 3
+    assert " fast_install --target" not in sidecars
 
 
 class TestInstallShUvDefaultIndex:
@@ -166,20 +190,24 @@ class TestInstallShUvDefaultIndex:
         assert '--default-index "$TORCH_INDEX_URL"' in self._sh
 
     def test_torch_installs_do_not_use_deprecated_index_url(self):
-        assert '--index-url "$TORCH_INDEX_URL"' not in self._sh
+        # pip has no --default-index, so the XPU `pip download` legitimately uses --index-url.
+        joined = self._sh.replace("\\\n", " ")
+        offenders = [
+            " ".join(line.split())
+            for line in joined.splitlines()
+            if '--index-url "$TORCH_INDEX_URL"' in line and "pip download" not in line
+        ]
+        assert not offenders, offenders
 
     def test_torch_installs_neutralize_all_uv_index_env_vars(self):
-        # --default-index installs run with all uv index env vars unset via `env -u`.
         assert (
             "env -u UV_DEFAULT_INDEX -u UV_INDEX_URL -u UV_INDEX -u UV_EXTRA_INDEX_URL" in self._sh
         )
 
 
-# Group 2 -- Shell snippet tests (bash subprocess, mocked python)
 class TestTorchConstraintShell:
     """Test the TORCH_CONSTRAINT block via bash with mocked python minor versions."""
 
-    # Snippet tested in isolation: override OS/_ARCH/SKIP_TORCH and a mock python.
     _SNIPPET_TEMPLATE = textwrap.dedent(r"""
         #!/bin/bash
         set -e
@@ -248,37 +276,44 @@ class TestTorchConstraintShell:
         assert result.returncode == 0, f"Script failed: {result.stderr}"
         return result.stdout.strip()
 
-    def test_arm64_macos_py313_tightened(self, tmp_path):
-        out = self._run(tmp_path, py_minor = 13, os_val = "macos", arch = "arm64")
-        assert out == "torch>=2.6,<2.11.0"
+    @pytest.mark.parametrize(
+        "py_minor, os_val, arch, expected",
+        [
+            pytest.param(
+                13, "macos", "arm64", "torch>=2.6,<2.11.0", id = "arm64_macos_py313_tightened"
+            ),
+            pytest.param(
+                14, "macos", "arm64", "torch>=2.6,<2.11.0", id = "arm64_macos_py314_tightened"
+            ),
+            pytest.param(
+                12, "macos", "arm64", "torch>=2.4,<2.11.0", id = "arm64_macos_py312_default"
+            ),
+            pytest.param(
+                11, "macos", "arm64", "torch>=2.4,<2.11.0", id = "arm64_macos_py311_default"
+            ),
+            pytest.param(13, "linux", "x86_64", "torch>=2.4,<2.11.0", id = "linux_x86_py313_default"),
+            pytest.param(
+                13, "linux", "aarch64", "torch>=2.4,<2.11.0", id = "linux_aarch64_py313_default"
+            ),
+            pytest.param(
+                13, "macos", "x86_64", "torch>=2.4,<2.11.0", id = "intel_mac_x86_py313_default"
+            ),
+            pytest.param(13, "wsl", "x86_64", "torch>=2.4,<2.11.0", id = "wsl_py313_default"),
+            pytest.param(
+                0, "macos", "arm64", "torch>=2.4,<2.11.0", id = "py_minor_0_fallback_default"
+            ),
+            pytest.param(
+                12, "macos", "arm64", "torch>=2.4,<2.11.0", id = "boundary_py_minor_12_not_tightened"
+            ),
+            pytest.param(
+                13, "macos", "arm64", "torch>=2.6,<2.11.0", id = "boundary_py_minor_13_tightened"
+            ),
+        ],
+    )
+    def test_torch_constraint_shell_cases(self, tmp_path, py_minor, os_val, arch, expected):
+        out = self._run(tmp_path, py_minor = py_minor, os_val = os_val, arch = arch)
+        assert out == expected
 
-    def test_arm64_macos_py314_tightened(self, tmp_path):
-        out = self._run(tmp_path, py_minor = 14, os_val = "macos", arch = "arm64")
-        assert out == "torch>=2.6,<2.11.0"
-
-    def test_arm64_macos_py312_default(self, tmp_path):
-        out = self._run(tmp_path, py_minor = 12, os_val = "macos", arch = "arm64")
-        assert out == "torch>=2.4,<2.11.0"
-
-    def test_arm64_macos_py311_default(self, tmp_path):
-        out = self._run(tmp_path, py_minor = 11, os_val = "macos", arch = "arm64")
-        assert out == "torch>=2.4,<2.11.0"
-
-    # Linux is unaffected by the tightening.
-    def test_linux_x86_py313_default(self, tmp_path):
-        out = self._run(tmp_path, py_minor = 13, os_val = "linux", arch = "x86_64")
-        assert out == "torch>=2.4,<2.11.0"
-
-    def test_linux_aarch64_py313_default(self, tmp_path):
-        out = self._run(tmp_path, py_minor = 13, os_val = "linux", arch = "aarch64")
-        assert out == "torch>=2.4,<2.11.0"
-
-    # Intel Mac: arch mismatch, no tightening.
-    def test_intel_mac_x86_py313_default(self, tmp_path):
-        out = self._run(tmp_path, py_minor = 13, os_val = "macos", arch = "x86_64")
-        assert out == "torch>=2.4,<2.11.0"
-
-    # SKIP_TORCH bypasses the tightening.
     def test_skip_torch_arm64_macos_py313_default(self, tmp_path):
         out = self._run(
             tmp_path,
@@ -289,28 +324,10 @@ class TestTorchConstraintShell:
         )
         assert out == "torch>=2.4,<2.11.0"
 
-    def test_wsl_py313_default(self, tmp_path):
-        out = self._run(tmp_path, py_minor = 13, os_val = "wsl", arch = "x86_64")
-        assert out == "torch>=2.4,<2.11.0"
-
-    def test_py_minor_0_fallback_default(self, tmp_path):
-        """Failed python query (returns 0) keeps the default constraint."""
-        out = self._run(tmp_path, py_minor = 0, os_val = "macos", arch = "arm64")
-        assert out == "torch>=2.4,<2.11.0"
-
-    def test_boundary_py_minor_12_not_tightened(self, tmp_path):
-        out = self._run(tmp_path, py_minor = 12, os_val = "macos", arch = "arm64")
-        assert out == "torch>=2.4,<2.11.0"
-
-    def test_boundary_py_minor_13_tightened(self, tmp_path):
-        out = self._run(tmp_path, py_minor = 13, os_val = "macos", arch = "arm64")
-        assert out == "torch>=2.6,<2.11.0"
-
     def test_mock_uv_receives_correct_constraint(self, tmp_path):
         """A mock uv receives the tightened constraint on py3.13 arm64 macOS."""
         venv = self._make_mock_python(tmp_path, minor = 13)
 
-        # Mock uv logs its arguments.
         mock_uv = tmp_path / "mock_uv"
         log_file = tmp_path / "uv_log.txt"
         mock_uv.write_text(
@@ -399,10 +416,7 @@ class TestTorchConstraintShell:
         logged = log_file.read_text()
         assert "torch>=2.4,<2.11.0" in logged, f"uv log: {logged}"
 
-    # Mirrors the _torch_index_leaf case in install.sh: rocm7.2 -> 2.11.x floor,
-    # CUDA -> widened <2.12.0 ceiling, else (CPU/older ROCm) -> default. Anchored
-    # on the final path segment, so a mirror base path containing cu*/rocm7.2 but
-    # ending in a cpu/older-rocm leaf keeps the default.
+    # Mirrors _torch_index_leaf in install.sh, anchored on the final path segment.
     _INDEX_SNIPPET = textwrap.dedent(r"""
         #!/bin/bash
         set -e
@@ -435,22 +449,33 @@ class TestTorchConstraintShell:
         url = f"https://download.pytorch.org/whl/{leaf}"
         assert self._resolve_index(tmp_path, url) == "torch>=2.4,<2.12.0"
 
-    def test_rocm72_index_uses_211_floor(self, tmp_path):
-        url = "https://download.pytorch.org/whl/rocm7.2"
-        assert self._resolve_index(tmp_path, url) == "torch>=2.11.0,<2.12.0"
-
-    def test_cpu_index_keeps_default(self, tmp_path):
-        # /cpu must NOT match the */cu[0-9]* branch.
-        url = "https://download.pytorch.org/whl/cpu"
-        assert self._resolve_index(tmp_path, url) == "torch>=2.4,<2.11.0"
-
-    def test_older_rocm_index_keeps_default(self, tmp_path):
-        url = "https://download.pytorch.org/whl/rocm7.1"
-        assert self._resolve_index(tmp_path, url) == "torch>=2.4,<2.11.0"
-
-    def test_cuda_index_custom_mirror_widens(self, tmp_path):
-        url = "https://internal.example.com/pytorch/cu128"
-        assert self._resolve_index(tmp_path, url) == "torch>=2.4,<2.12.0"
+    @pytest.mark.parametrize(
+        "url, expected",
+        [
+            pytest.param(
+                "https://download.pytorch.org/whl/rocm7.2",
+                "torch>=2.11.0,<2.12.0",
+                id = "rocm72_index_uses_211_floor",
+            ),
+            pytest.param(
+                "https://download.pytorch.org/whl/cpu",
+                "torch>=2.4,<2.11.0",
+                id = "cpu_index_keeps_default",
+            ),
+            pytest.param(
+                "https://download.pytorch.org/whl/rocm7.1",
+                "torch>=2.4,<2.11.0",
+                id = "older_rocm_index_keeps_default",
+            ),
+            pytest.param(
+                "https://internal.example.com/pytorch/cu128",
+                "torch>=2.4,<2.12.0",
+                id = "cuda_index_custom_mirror_widens",
+            ),
+        ],
+    )
+    def test_torch_constraint_shell_cases_2(self, tmp_path, url, expected):
+        assert self._resolve_index(tmp_path, url) == expected
 
     @pytest.mark.parametrize(
         "url",
@@ -460,12 +485,9 @@ class TestTorchConstraintShell:
         ],
     )
     def test_cuda_in_mirror_path_but_noncuda_leaf_keeps_default(self, tmp_path, url):
-        # A cu128 in the mirror base path must not widen when the leaf is cpu /
-        # older ROCm: the case anchors on _torch_index_leaf, not the whole URL.
         assert self._resolve_index(tmp_path, url) == "torch>=2.4,<2.11.0"
 
 
-# Group 3 -- E2E tokenizers fix (requires network, ~2-5 min)
 @pytest.mark.e2e
 class TestE2ETokenizersFix:
     """Real uv venvs verify tokenizers + transformers work without torch installed."""
@@ -530,12 +552,14 @@ class TestE2ETokenizersFix:
         assert result.returncode != 0, "torch should NOT be importable"
 
     def test_negative_control_no_tokenizers(self, tmp_path):
-        """Without the tokenizers line, AutoConfig must fail (negative control)."""
+        """Drops tokenizers by package name, since an exact-line match misses any version-bounded entry."""
         venv = self._create_venv(tmp_path, "neg-ctrl", "3.12")
         req_no_tokenizers = tmp_path / "no-tokenizers.txt"
         req_no_tokenizers.write_text(
             "\n".join(
-                line for line in _read(_NO_TORCH_RT).splitlines() if line.strip() != "tokenizers"
+                line
+                for line in _read(_NO_TORCH_RT).splitlines()
+                if not re.match(r"tokenizers([^A-Za-z0-9._-]|$)", line.strip())
             ),
             encoding = "utf-8",
         )
@@ -546,7 +570,6 @@ class TestE2ETokenizersFix:
         assert "tokenizers" in result.stderr.lower() or "ModuleNotFoundError" in result.stderr
 
 
-# Group 4 -- Integration: install.sh reads no-torch-runtime.txt correctly
 class TestInstallShNoTorchIntegration:
     """Verify install.sh has the correct no-torch-runtime.txt wiring."""
 
@@ -575,7 +598,6 @@ class TestInstallShNoTorchIntegration:
         assert found, "SKIP_TORCH=true block should call _find_no_torch_runtime"
 
 
-# Group 5 -- Full no-torch sandbox (requires network, ~5 min)
 @pytest.mark.e2e
 class TestE2EFullNoTorchSandbox:
     """Creates venvs and installs the actual no-torch-runtime.txt."""

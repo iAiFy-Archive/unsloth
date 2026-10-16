@@ -2,8 +2,9 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { usePlatformStore } from "@/config/env";
+import { getHfEndpoint, useHfEndpoint } from "@/lib/hf-endpoint";
 import type { PipelineType } from "@huggingface/hub";
-import { listModels } from "@huggingface/hub";
+import { listModels, modelInfo } from "@huggingface/hub";
 import {
   startTransition,
   useCallback,
@@ -17,6 +18,7 @@ import {
   primeCacheFromListing,
 } from "../lib/hf-cache";
 import { EMBEDDING_TAGS, estimateSizeFromDtypes } from "../lib/hf-model-meta";
+import { mergeTaskIterators } from "../lib/merge-task-iterators";
 import { detectBaseModel } from "../lib/model-capabilities";
 import { isGgufLike } from "../lib/model-identifiers";
 import { fetchWithTimeout } from "../lib/network";
@@ -24,15 +26,18 @@ import {
   type UnslothSupport,
   type UnslothSupportStatus,
   classifyUnslothSupport,
-  excludedFormatTagsForDevice,
 } from "../lib/unsloth-support";
+import {
+  filterModelListing,
+  hasModelSearchFilters,
+  parameterRange,
+  type ModelSearchFilters,
+} from "../lib/model-search-filters";
 import { pullBatch, useHubPaginatedSearch } from "./use-hub-paginated-search";
 
-// "gguf" is not in the @huggingface/hub expandable-key type, but the listing
-// supports expand=gguf (see withGgufExpand) and listModels' pick() copies any
-// requested field through at runtime. Request it here so GGUF repos whose id
-// has no "<n>B" token (Kimi, MiniMax, GLM) still populate m.gguf.total for the
-// param chip / OOM badge. The cast bridges that single library type gap.
+// "gguf" is not in the @huggingface/hub expandable-key type, but the listing supports
+// expand=gguf and listModels' pick() copies any requested field through at runtime. Request it
+// so GGUF repos whose id has no "<n>B" token (Kimi, MiniMax, GLM) still populate m.gguf.total.
 const ALL_FIELDS = [
   "safetensors",
   "tags",
@@ -79,25 +84,6 @@ function taskMatches(
   );
 }
 
-async function* mergeTaskIterators(
-  tasks: readonly PipelineType[],
-  createIter: (task?: PipelineType) => AsyncGenerator<unknown>,
-): AsyncGenerator<unknown> {
-  const seen = new Set<string>();
-  const taskList = tasks.length > 0 ? tasks : [undefined];
-  for (const task of taskList) {
-    for await (const model of createIter(task)) {
-      const name = (model as { name?: string }).name;
-      if (name) {
-        const key = name.toLowerCase();
-        if (seen.has(key)) continue;
-        seen.add(key);
-      }
-      yield model;
-    }
-  }
-}
-
 export interface HfModelResult {
   id: string;
   downloads: number;
@@ -106,6 +92,8 @@ export interface HfModelResult {
   gated?: false | "auto" | "manual";
   totalParams?: number;
   estimatedSizeBytes?: number;
+  /** Catalog size for a row painted before the listing reports it, never from a Hub response. */
+  curatedSizeBytes?: number;
   isGguf: boolean;
   baseModel?: string | null;
   tags?: string[];
@@ -121,10 +109,9 @@ export interface HfModelResult {
 const DESC_ONLY_SORTS = new Set<HfSortKey>(["trendingScore"]);
 const HF_SEARCH_TIMEOUT_MS = 15_000;
 
-// The HF listModels lib doesn't whitelist gguf metadata, but the listing
-// supports it. Append expand=gguf so GGUF repos report a param count (used for
-// the size / OOM badge) even when the name has no "<n>B" token (Kimi, MiniMax,
-// GLM). Shared by every fetch path so the badge is consistent.
+// The HF listModels lib doesn't whitelist gguf metadata, but the listing supports it. Append
+// expand=gguf so GGUF repos report a param count for the size / OOM badge even when the name
+// has no "<n>B" token. Shared by every fetch path so the badge is consistent.
 function withGgufExpand(input: Parameters<typeof fetch>[0]): string {
   const rawUrl =
     typeof input === "string"
@@ -152,6 +139,7 @@ function makeSortFetch(
   sortBy: HfSortKey | undefined,
   direction: HfSortDirection,
   signal?: AbortSignal,
+  parameterFilter = "",
 ): typeof fetch {
   return (input, init) => {
     const rawUrl =
@@ -161,6 +149,8 @@ function makeSortFetch(
           ? input.toString()
           : input.url;
     const url = new URL(rawUrl);
+    if (parameterFilter)
+      url.searchParams.set("num_parameters", parameterFilter);
 
     if (sortBy && !url.searchParams.has("sort")) {
       url.searchParams.set("sort", sortBy);
@@ -182,13 +172,13 @@ function makeSortFetch(
 
 function makeMapModel(
   excludeGguf: boolean,
-  excludedTags: ReadonlySet<string>,
   keepUnsupportedTags: boolean,
   idSuffix: string,
   deviceType: string | null,
 ) {
   const suffixLower = idSuffix.toLowerCase();
   return (raw: unknown): HfModelResult | null => {
+    if (raw === null) return null;
     const m = raw as {
       name: string;
       downloads?: number;
@@ -210,24 +200,23 @@ function makeMapModel(
       return null;
     }
     const isEmbedding = m.tags?.some((t) => EMBEDDING_TAGS.has(t));
-    if (
-      !keepUnsupportedTags &&
-      !isEmbedding &&
-      m.tags?.some((t) => excludedTags.has(t))
-    ) {
-      return null;
-    }
+    // A repo cross-tagged "gguf" that is actually a diffusers pipeline (e.g. an unsloth *-bnb-4bit image model) ships no .gguf files, so the variant
+    // expander would dead-end at "No GGUF variants found." Trust the bare tag only when the repo is not a pipeline; "-GGUF" and real metadata still win.
+    const isDiffusersPipeline =
+      m.library_name?.toLowerCase() === "diffusers" ||
+      Boolean(m.tags?.some((tag) => tag.toLowerCase().startsWith("diffusers:")));
     const isGguf =
-      Boolean(m.tags?.some((tag) => tag.toLowerCase() === "gguf")) ||
-      isGgufLike(m.name);
+      isGgufLike(m.name) ||
+      Boolean(m.gguf) ||
+      (Boolean(m.tags?.some((tag) => tag.toLowerCase() === "gguf")) &&
+        !isDiffusersPipeline);
     if (excludeGguf && isGguf) {
       return null;
     }
     const pipelineTag = m.task ?? m.pipeline_tag;
     const quantMethod = m.config?.quantization_config?.quant_method;
-    // Drop runtime-unloadable models before they reach the row list. Discover
-    // opts out via keepUnsupportedTags to render them with a "may not be supported"
-    // dot. Embeddings skip the gate: their pipeline tag is unsupported for chat but trainable.
+    // Drop runtime-unloadable models before they reach the row list. Discover opts out via
+    // keepUnsupportedTags. Embeddings skip the gate: unsupported for chat but trainable.
     if (!keepUnsupportedTags && !isEmbedding) {
       const support = classifyUnslothSupport({
         modelId: m.name,
@@ -278,14 +267,15 @@ const UNSLOTH_PREFETCH = 20;
 const UNSLOTH_QUERY_PREFETCH = 3;
 /** With a publisher query, fewer unsloth results before the pinned publisher model. */
 const UNSLOTH_PINNED_PREFETCH = 4;
+/** Rejected unsloth rows a filtered search scans before moving on to general results. */
+const UNSLOTH_FILTER_REJECT_LIMIT = 40;
 /** Matches a valid "owner/repo" identifier (exactly two non-empty segments). */
 const PUBLISHER_RE = /^([^/\s]+)\/([^/\s]+)$/;
 
 /**
- * Prime the hf-cache from a listModels result. For public models also prime the
- * anonymous slot so the VRAM hook gets cache hits; gated/private models are cached
- * only under the caller's token to avoid auth leakage.
- */
+* Prime the hf-cache from a listModels result. For public models also prime the anonymous slot
+* so the VRAM hook gets cache hits; gated/private models are cached only under the caller's token.
+*/
 function primeFromListing(
   name: string,
   accessToken: string | undefined,
@@ -298,6 +288,10 @@ function primeFromListing(
   }
 }
 
+type ModelListingTransform = (
+  iterator: AsyncGenerator<unknown>,
+) => AsyncGenerator<unknown>;
+
 /** Merged generator yielding unsloth-owned models first, then deduped general results. */
 async function* mergedModelIterator(
   query: string,
@@ -307,35 +301,42 @@ async function* mergedModelIterator(
   sortBy: HfSortKey = "downloads",
   direction: HfSortDirection = "desc",
   signal?: AbortSignal,
+  parameterFilter = "",
+  filterPriority?: ModelListingTransform,
 ): AsyncGenerator<unknown> {
-  const sortFetch = makeSortFetch(sortBy, direction, signal);
   const tasks = normalizeTaskFilter(task);
   const common = {
     additionalFields: ALL_FIELDS,
-    fetch: sortFetch,
     ...(accessToken ? { credentials: { accessToken } } : {}),
   };
 
   const unslothIter = mergeTaskIterators(
     tasks,
-    (task) =>
+    (task, taskSignal) =>
       listModels({
+        hubUrl: getHfEndpoint(),
         search: { query, owner: "unsloth", ...(task ? { task } : {}) },
+        fetch: makeSortFetch(sortBy, direction, taskSignal, parameterFilter),
         ...common,
       }) as AsyncGenerator<unknown>,
+    signal,
   );
   const generalIter = mergeTaskIterators(
     tasks,
-    (task) =>
+    (task, taskSignal) =>
       listModels({
+        hubUrl: getHfEndpoint(),
         search: { query, ...(task ? { task } : {}) },
+        fetch: makeSortFetch(sortBy, direction, taskSignal, parameterFilter),
         ...common,
       }) as AsyncGenerator<unknown>,
+    signal,
   );
 
   // Start the pinned lookup now so it runs in parallel with Phase 1 instead of blocking Phase 2.
   const pinnedPromise = pinnedId
     ? cachedModelInfo({
+        hubUrl: getHfEndpoint(),
         name: pinnedId,
         additionalFields: ALL_FIELDS,
         fetch: makeHfFetch(signal),
@@ -352,7 +353,15 @@ async function* mergedModelIterator(
   // Phase 1: unsloth models first
   const seen = new Set<string>();
   let count = 0;
-  for await (const model of unslothIter) {
+  let rejected = 0;
+  for await (const model of filterPriority
+    ? filterPriority(unslothIter)
+    : unslothIter) {
+    if (model === null) {
+      yield null;
+      if (++rejected >= UNSLOTH_FILTER_REJECT_LIMIT) break;
+      continue;
+    }
     const m = model as { name?: string };
     if (m.name) {
       seen.add(m.name);
@@ -396,11 +405,11 @@ async function* priorityThenListingIterator(
   sortBy: HfSortKey = "downloads",
   direction: HfSortDirection = "desc",
   signal?: AbortSignal,
+  parameterFilter = "",
 ): AsyncGenerator<unknown> {
   const tasks = normalizeTaskFilter(task);
   const common = {
     additionalFields: ALL_FIELDS,
-    fetch: makeSortFetch(sortBy, direction, signal),
     ...(accessToken ? { credentials: { accessToken } } : {}),
   };
 
@@ -409,6 +418,7 @@ async function* priorityThenListingIterator(
   const settled = await Promise.allSettled(
     priorityIds.map((id) =>
       cachedModelInfo({
+        hubUrl: getHfEndpoint(),
         name: id,
         additionalFields: ALL_FIELDS,
         fetch: makeHfFetch(signal),
@@ -427,11 +437,14 @@ async function* priorityThenListingIterator(
 
   const generalIter = mergeTaskIterators(
     tasks,
-    (task) =>
+    (task, taskSignal) =>
       listModels({
+        hubUrl: getHfEndpoint(),
         search: { owner: "unsloth", ...(task ? { task } : {}) },
+        fetch: makeSortFetch(sortBy, direction, taskSignal, parameterFilter),
         ...common,
       }) as AsyncGenerator<unknown>,
+    signal,
   );
   for await (const model of generalIter) {
     const m = model as { name?: string };
@@ -460,19 +473,26 @@ function createChannelIterator(
     sortDirection: HfSortDirection;
     accessToken?: string;
     signal: AbortSignal;
+    parameterFilter?: string;
   },
 ): AsyncGenerator<unknown> {
   const channelTags =
     channel.tags && channel.tags.length ? [...channel.tags] : undefined;
   const queryString = opts.query || channel.query || undefined;
   return listModels({
+    hubUrl: getHfEndpoint(),
     search: {
       ...(queryString ? { query: queryString } : {}),
       ...(channel.owner ? { owner: channel.owner } : {}),
       ...(channelTags ? { tags: channelTags } : {}),
     },
     additionalFields: ALL_FIELDS,
-    fetch: makeSortFetch(opts.sortBy, opts.sortDirection, opts.signal),
+    fetch: makeSortFetch(
+      opts.sortBy,
+      opts.sortDirection,
+      opts.signal,
+      opts.parameterFilter,
+    ),
     sort: opts.sortBy,
     ...(opts.accessToken
       ? { credentials: { accessToken: opts.accessToken } }
@@ -483,9 +503,8 @@ function createChannelIterator(
 // Bound the unsloth pass so a huge unsloth slice can't starve the general listing under scroll.
 const UNSLOTH_CHANNEL_PREFETCH = 60;
 
-// For tag/format channels without a fixed owner (e.g. GGUF filter), yield unsloth
-// models first (in sort order), then the rest with already-seen unsloth repos removed,
-// floating unsloth to the top even when sorting by downloads/likes.
+// For tag/format channels without a fixed owner (e.g. GGUF filter), yield unsloth models first
+// (in sort order), then the rest deduped, floating unsloth to the top under any sort.
 async function* channelUnslothFirstIterator(
   channel: { tags?: string[]; query?: string },
   opts: {
@@ -494,6 +513,8 @@ async function* channelUnslothFirstIterator(
     sortDirection: HfSortDirection;
     accessToken?: string;
     signal: AbortSignal;
+    parameterFilter?: string;
+    filterPriority?: ModelListingTransform;
   },
 ): AsyncGenerator<unknown> {
   const queryString = opts.query || channel.query || undefined;
@@ -503,18 +524,32 @@ async function* channelUnslothFirstIterator(
   const seen = new Set<string>();
 
   const unslothIter = listModels({
+    hubUrl: getHfEndpoint(),
     search: {
       ...(queryString ? { query: queryString } : {}),
       owner: "unsloth",
       ...(channel.tags ? { tags: channel.tags } : {}),
     },
     additionalFields: ALL_FIELDS,
-    fetch: makeSortFetch(opts.sortBy, opts.sortDirection, opts.signal),
+    fetch: makeSortFetch(
+      opts.sortBy,
+      opts.sortDirection,
+      opts.signal,
+      opts.parameterFilter,
+    ),
     sort: opts.sortBy,
     ...creds,
   }) as AsyncGenerator<unknown>;
   let count = 0;
-  for await (const model of unslothIter) {
+  let rejected = 0;
+  for await (const model of opts.filterPriority
+    ? opts.filterPriority(unslothIter)
+    : unslothIter) {
+    if (model === null) {
+      yield null;
+      if (++rejected >= UNSLOTH_FILTER_REJECT_LIMIT) break;
+      continue;
+    }
     const name = (model as { name?: string }).name;
     if (name) seen.add(name);
     yield model;
@@ -522,12 +557,18 @@ async function* channelUnslothFirstIterator(
   }
 
   const generalIter = listModels({
+    hubUrl: getHfEndpoint(),
     search: {
       ...(queryString ? { query: queryString } : {}),
       ...(channel.tags ? { tags: channel.tags } : {}),
     },
     additionalFields: ALL_FIELDS,
-    fetch: makeSortFetch(opts.sortBy, opts.sortDirection, opts.signal),
+    fetch: makeSortFetch(
+      opts.sortBy,
+      opts.sortDirection,
+      opts.signal,
+      opts.parameterFilter,
+    ),
     sort: opts.sortBy,
     ...creds,
   }) as AsyncGenerator<unknown>;
@@ -572,7 +613,6 @@ export async function fetchChannelFirstPage(
   } = options;
   const mapModel = makeMapModel(
     excludeGguf,
-    excludedFormatTagsForDevice(deviceType),
     keepUnsupportedTags,
     channel.idSuffix ?? "",
     deviceType,
@@ -609,13 +649,13 @@ export function useHubModelSearch(
     sortDirection?: HfSortDirection;
     pinUnslothFirst?: boolean;
     /**
-     * "unsloth" restricts listings to the unsloth org; "all" surfaces the whole
-     * Hub with unsloth floated to the top. Owner-fixed channel presets ignore this.
-     */
+    * "unsloth" restricts listings to the unsloth org; "all" surfaces the whole Hub with unsloth
+    * floated to the top. Owner-fixed channel presets ignore this. */
     ownerScope?: "unsloth" | "all";
     enabled?: boolean;
     keepUnsupportedTags?: boolean;
     channel?: HfModelSearchChannel | null;
+    filters?: ModelSearchFilters;
   },
 ) {
   const {
@@ -630,6 +670,7 @@ export function useHubModelSearch(
     enabled = true,
     keepUnsupportedTags = false,
     channel = null,
+    filters,
   } = options ?? {};
   const unslothOnly = ownerScope === "unsloth";
 
@@ -656,16 +697,17 @@ export function useHubModelSearch(
     };
   }, [query]);
 
-  const createIter = useCallback(
-    (signal: AbortSignal) => {
-      // Channel scoping bypasses the unsloth-merge iterator: a hard owner/tag
-      // filter shows just that curated slice, with the user's text query forwarded in.
+  const hfEndpoint = useHfEndpoint();
+  const hasFilters = !!filters && hasModelSearchFilters(filters);
+  const filterRange = filters ? parameterRange(filters) : "";
+  const createListing = useCallback(
+    (signal: AbortSignal, filterPriority?: ModelListingTransform) => {
+      // Channel scoping bypasses the unsloth-merge iterator: a hard owner/tag filter shows that slice.
       if (channelOwner || channelTagsKey || channelQuery) {
         const channelTags = channelTagsKey
           ? channelTagsKey.split("|")
           : undefined;
-        // Unsloth-only scope on an ownerless tag/format channel (e.g. GGUF filter):
-        // hard-restrict the slice to unsloth-owned repos.
+        // Unsloth-only scope on an ownerless tag/format channel: hard-restrict to unsloth-owned repos.
         if (unslothOnly && !channelOwner) {
           return createChannelIterator(
             {
@@ -679,6 +721,7 @@ export function useHubModelSearch(
               sortDirection,
               accessToken,
               signal,
+              parameterFilter: filterRange,
             },
           );
         }
@@ -692,11 +735,12 @@ export function useHubModelSearch(
               sortDirection,
               accessToken,
               signal,
+              parameterFilter: filterRange,
+              filterPriority,
             },
           );
         }
-        // User text query takes precedence over channel.query; without it, the
-        // channel's own query (e.g. "bnb-4bit") narrows the listing server-side.
+        // User text query takes precedence over channel.query, which otherwise narrows server-side.
         return createChannelIterator(
           {
             owner: channelOwner ?? undefined,
@@ -709,6 +753,7 @@ export function useHubModelSearch(
             sortDirection,
             accessToken,
             signal,
+            parameterFilter: filterRange,
           },
         );
       }
@@ -722,47 +767,69 @@ export function useHubModelSearch(
             sortBy,
             sortDirection,
             signal,
+            filterRange,
           ) as AsyncGenerator<unknown>;
+        }
+        if (hasFilters && pinUnslothFirst && !unslothOnly) {
+          return mergedModelIterator(
+            "",
+            task,
+            accessToken,
+            undefined,
+            sortBy,
+            sortDirection,
+            signal,
+            filterRange,
+            filterPriority,
+          );
         }
         return mergeTaskIterators(
           normalizeTaskFilter(task),
-          (task) =>
+          (task, taskSignal) =>
             listModels({
+              hubUrl: getHfEndpoint(),
               // Unsloth-only scope restricts the plain sort browse to the org.
               search: {
                 ...(unslothOnly ? { owner: "unsloth" } : {}),
                 ...(task ? { task } : {}),
               },
               additionalFields: ALL_FIELDS,
-              fetch: makeSortFetch(sortBy, sortDirection, signal),
+              fetch: makeSortFetch(
+                sortBy,
+                sortDirection,
+                taskSignal,
+                filterRange,
+              ),
               sort: sortBy,
               ...(accessToken ? { credentials: { accessToken } } : {}),
             }) as AsyncGenerator<unknown>,
+          signal,
         );
       }
-      // Unsloth-only typed query: search within the org rather than floating
-      // a few unsloth hits above the global relevance ranking.
+      // Unsloth-only typed query: search within the org rather than floating a few hits globally.
       if (unslothOnly) {
         return listModels({
+          hubUrl: getHfEndpoint(),
           search: { query: searchQuery, owner: "unsloth" },
           additionalFields: ALL_FIELDS,
-          fetch: makeSortFetch(sortBy, sortDirection, signal),
+          fetch: makeSortFetch(sortBy, sortDirection, signal, filterRange),
           sort: sortBy,
           ...(accessToken ? { credentials: { accessToken } } : {}),
         }) as AsyncGenerator<unknown>;
       }
-      // Typed query: drop the task filter so searched models appear despite
-      // wrong/missing HF task metadata. For an "owner/repo" query, strip the org
-      // prefix so unsloth variants surface, then pin the original publisher model.
-      // Unsloth-owned queries are left as-is for the full prefetch + secondary sort.
+      // Typed query: drop the task filter so searched models appear despite wrong/missing HF task
+      // metadata. For an "owner/repo" query, strip the org prefix so unsloth variants surface, then
+      // pin the original publisher model. Unsloth-owned queries are left as-is.
       return mergedModelIterator(
         searchQuery,
         undefined,
         accessToken,
-        pinnedId,
+        hasFilters ? undefined : pinnedId,
         sortBy,
         sortDirection,
         signal,
+        filterRange,
+        filterPriority,
       ) as AsyncGenerator<unknown>;
     },
     [
@@ -779,23 +846,90 @@ export function useHubModelSearch(
       channelQuery,
       pinUnslothFirst,
       unslothOnly,
+      hasFilters,
+      filterRange,
+    ],
+  );
+
+  const createIter = useCallback(
+    (signal: AbortSignal) => {
+      if (!filters || !hasFilters) return createListing(signal);
+      const metadata = new Map<
+        string,
+        Promise<Record<string, unknown> | null>
+      >();
+      const requestJson = async (path: string) => {
+        const response = await fetchWithTimeout(
+          `${hfEndpoint}${path}`,
+          {
+            signal,
+            ...(accessToken
+              ? { headers: { Authorization: `Bearer ${accessToken}` } }
+              : {}),
+          },
+          HF_SEARCH_TIMEOUT_MS,
+        );
+        if ([401, 403, 404].includes(response.status)) return null;
+        if (!response.ok) {
+          throw new Error(
+            `Model filter metadata request failed (HTTP ${response.status})`,
+          );
+        }
+        // One repo's malformed config.json must not abort the whole search.
+        return response.json().catch(() => null);
+      };
+      const fetchJson = (path: string) => {
+        let request = metadata.get(path);
+        if (!request) {
+          request = requestJson(path);
+          metadata.set(path, request);
+        }
+        return request;
+      };
+      const filterPriority: ModelListingTransform = (iterator) =>
+        filterModelListing(iterator, filters, fetchJson);
+      const iterator = createListing(signal, filterPriority);
+      const pinnedPromise =
+        pinnedId &&
+        !unslothOnly &&
+        !channelOwner &&
+        !channelTagsKey &&
+        !channelQuery
+          ? modelInfo({
+              hubUrl: hfEndpoint,
+              name: pinnedId,
+              additionalFields: ALL_FIELDS,
+              fetch: makeHfFetch(signal),
+              ...(accessToken ? { credentials: { accessToken } } : {}),
+            }).catch(() => null)
+          : undefined;
+      return filterModelListing(iterator, filters, fetchJson, pinnedPromise);
+    },
+    [
+      createListing,
+      filters,
+      hasFilters,
+      pinnedId,
+      unslothOnly,
+      channelOwner,
+      channelTagsKey,
+      channelQuery,
+      hfEndpoint,
+      accessToken,
     ],
   );
 
   const deviceType = usePlatformStore((s) => s.deviceType);
-  const excludedTags = excludedFormatTagsForDevice(deviceType);
   const mapModel = useMemo(
     () =>
       makeMapModel(
         excludeGguf,
-        excludedTags,
         keepUnsupportedTags,
         channelIdSuffix,
         deviceType,
       ),
     [
       excludeGguf,
-      excludedTags,
       keepUnsupportedTags,
       channelIdSuffix,
       deviceType,
@@ -803,14 +937,11 @@ export function useHubModelSearch(
   );
   const search = useHubPaginatedSearch(createIter, mapModel, { enabled });
 
-  // Secondary sort only with no user query (merged iterator already floats
-  // unsloth results; re-sorting would bury matches) and outside channel scoping.
-  //
-  // STABLE-APPEND CONTRACT: when a later page lands, keep the sorted prefix
-  // verbatim and append only the new tail. Re-sorting the whole array would let
-  // a late unsloth/* repo jump to an earlier index and bump the viewport during
-  // infinite scroll, so we only sort when the listing resets (length shrinks or
-  // zeros), where re-ordering is safe.
+  // Secondary sort only with no user query (the merged iterator already floats unsloth results) and
+  // outside channel scoping. STABLE-APPEND CONTRACT: when a later page lands, keep the sorted
+  // prefix verbatim and append only the new tail, else a late unsloth/* repo jumps earlier and
+  // bumps the viewport. Sort only when the listing resets (length shrinks or zeros), where
+  // re-ordering is safe.
   const [stableCache, setStableCache] = useState<{
     source: HfModelResult[] | null;
     length: number;
@@ -819,8 +950,7 @@ export function useHubModelSearch(
   }>({ source: null, length: 0, results: [], sorted: false });
 
   const incoming = search.results;
-  // Owner-scoped channels return a single owner, so re-sorting is a no-op there;
-  // tag/format channels (e.g. GGUF) and plain browsing still float unsloth first.
+  // Owner-scoped channels return one owner, so re-sorting is a no-op; tag/format channels float unsloth.
   const sortingDisabled =
     !pinUnslothFirst || isPublisherQuery || trimmed || Boolean(channelOwner);
   const { results, nextCache } = useMemo(() => {

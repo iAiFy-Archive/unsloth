@@ -17,12 +17,10 @@ def _module_calls(source: str):
 
 def test_top_level_run_alias_registered():
     """`app.command("run", ...)` must be invoked with studio_run as its target."""
-    source = _CLI_INIT.read_text()
+    source = _CLI_INIT.read_text(encoding = "utf-8")
 
-    # Find ``app.command("run", ...)`` call -- the decorator-call form.
     found_decorator_call = False
     for call in _module_calls(source):
-        # Match ``app.command(...)`` syntactically.
         if not (
             isinstance(call.func, ast.Attribute)
             and call.func.attr == "command"
@@ -30,7 +28,6 @@ def test_top_level_run_alias_registered():
             and call.func.value.id == "app"
         ):
             continue
-        # "run" appears as the first positional arg or as keyword name="run".
         first_pos = call.args[0] if call.args else None
         keyword_name = next((kw.value for kw in call.keywords if kw.arg == "name"), None)
         is_run = (isinstance(first_pos, ast.Constant) and first_pos.value == "run") or (
@@ -46,7 +43,7 @@ def test_top_level_run_alias_registered():
 
 def test_studio_run_imported_for_alias():
     """The alias must wire up to the studio.run function, not redefine it."""
-    source = _CLI_INIT.read_text()
+    source = _CLI_INIT.read_text(encoding = "utf-8")
     tree = ast.parse(source)
     has_import = False
     for node in ast.walk(tree):

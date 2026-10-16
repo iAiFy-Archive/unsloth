@@ -9,7 +9,7 @@ Unsloth cannot load it today. This module answers, without authentication, code 
 or trust_remote_code:
 
   1. Does the LATEST transformers release on PyPI ship this ``model_type``?
-  2. Does transformers ``main`` on GitHub ship it (dev-only, not yet installable)?
+  2. Does transformers ``main`` on GitHub ship it (installable from main after consent)?
 
 Sources (all unauthenticated; raw.githubusercontent.com is not API rate-limited and
 api.github.com is deliberately never used):
@@ -23,8 +23,9 @@ computed exactly like the local overlay answer.
 
 Results are cached in memory and in a small JSON snapshot under ``studio_root()/cache``
 (ttl ~1 day) so repeated tier resolutions never re-fetch; failures are backed off in
-memory. Every fetch is bounded (<=5s, one retry), so a hung network cannot block model
-loading. Fully offline-safe: offline env vars or the kill switch
+memory. Every fetch is bounded by an explicit wall-clock budget on the transfer (not just
+the socket timeout, which only bounds one read), so a hung or drip-feeding network cannot
+block model loading. Fully offline-safe: offline env vars or the kill switch
 ``UNSLOTH_STUDIO_NO_LATEST_TRANSFORMERS=1`` make every check return None (current
 behavior preserved).
 
@@ -33,8 +34,10 @@ persistent ``.venv_t5_latest`` sidecar via
 :func:`utils.transformers_version.ensure_latest_transformers_venv`.
 """
 
+import contextlib
 import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -68,18 +71,38 @@ _AUTO_FILES = ("configuration_auto.py", "auto_mappings.py")
 
 _FETCH_TIMEOUT_SECONDS = 5.0
 _FETCH_RETRIES = 1
+# urlopen's timeout bounds each individual read, never the whole transfer.
+# Measured: 12 chunks 1s apart read in 12.0s under timeout=5.0. The transfer gets its own wall-clock budget instead, one
+# for the connect and one for the body.
+_FETCH_DEADLINE_SECONDS = 2 * _FETCH_TIMEOUT_SECONDS
+# One attempt's true worst case: the budget, plus the single socket read already blocking
+# when it runs out (the deadline is only tested between reads).
+_FETCH_ATTEMPT_SECONDS = _FETCH_DEADLINE_SECONDS + _FETCH_TIMEOUT_SECONDS
+_READ_CHUNK_BYTES = 1 << 16
 _CACHE_TTL_SECONDS = 24 * 60 * 60
 _FAILURE_BACKOFF_SECONDS = 300
 
 _CACHE_FILE_NAME = "transformers_latest_check.json"
-_SNAPSHOT_SCHEMA = 1
+# 2 adds main_version: a schema-1 file would hide the main install until its TTL.
+_SNAPSHOT_SCHEMA = 2
 
-# Snapshot: {"schema", "fetched_at", "pypi_version", "pypi_model_types", "main_model_types"}.
+# Snapshot: {"schema", "fetched_at", "pypi_version", "pypi_model_types", "main_model_types",
+# "main_checked", "main_version"}.
 # Install-in-progress state lives in utils.transformers_version (the sidecar swap reservation).
 _lock = threading.Lock()
 _memory_snapshot: dict | None = None
 _last_failure_at: float = 0.0
 _is_fetching: bool = False
+# Set whenever no refresh is in flight; a concurrent caller waits on it for the running
+# fetch's answer instead of reporting "no answer" (see _get_snapshot).
+_fetch_done: threading.Event = threading.Event()
+_fetch_done.set()
+# Derived rather than a literal, so tuning a timeout or retry cannot silently shrink the backstop below what it bounds;
+# giving up early reads as "no upgrade needed" at the Start button.
+# Bounded by the refresh's OWN worst case: the PyPI version plus both auto files at each of the two refs, each allowed
+# its retry at _FETCH_ATTEMPT_SECONDS. The waiter re-waits while the refresh is genuinely in flight (_get_snapshot).
+_REFRESH_URL_COUNT = 1 + 2 * len(_AUTO_FILES)
+_INFLIGHT_WAIT_SECONDS = _REFRESH_URL_COUNT * (1 + _FETCH_RETRIES) * _FETCH_ATTEMPT_SECONDS + 5.0
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 
@@ -99,8 +122,30 @@ def _cache_file() -> Path:
 _FETCH_MISSING = "__unsloth_fetch_missing__"
 
 
+def _read_within(resp, deadline: float) -> str | None:
+    """Body of *resp*, or None if the transfer is still running at *deadline*.
+
+    ``resp.read()`` in one call has no bound at all: the socket timeout only fires on a
+    read that stalls longer than itself, so a drip-fed response never trips it. ``read1``
+    returns what has arrived instead of blocking for a full chunk, which is what lets the
+    budget be checked as the body comes in.
+    """
+    read1 = getattr(resp, "read1", None)
+    if read1 is None:
+        # A file-like that hands back the whole body in one go has nothing to dribble.
+        return resp.read().decode("utf-8", "replace")
+    chunks: list[bytes] = []
+    while True:
+        if time.monotonic() >= deadline:
+            return None
+        chunk = read1(_READ_CHUNK_BYTES)
+        if not chunk:
+            return b"".join(chunks).decode("utf-8", "replace")
+        chunks.append(chunk)
+
+
 def _fetch_text(url: str) -> str | None:
-    """GET *url* with a bounded timeout and one retry; None on any failure.
+    """GET *url* within a bounded wall-clock budget, one retry; None on any failure.
 
     Returns ``_FETCH_MISSING`` (without retrying) on HTTP 404 so callers can tell
     "absent at this ref" apart from "network flaked".
@@ -109,10 +154,19 @@ def _fetch_text(url: str) -> str | None:
     import urllib.request
 
     for attempt in range(1 + _FETCH_RETRIES):
+        deadline = time.monotonic() + _FETCH_DEADLINE_SECONDS
         try:
             req = urllib.request.Request(url, headers = {"User-Agent": "unsloth-studio"})
             with urllib.request.urlopen(req, timeout = _FETCH_TIMEOUT_SECONDS) as resp:
-                return resp.read().decode("utf-8", "replace")
+                body = _read_within(resp, deadline)
+            if body is not None:
+                return body
+            logger.debug(
+                "Fetch (attempt %d) for %s outran its %.1fs budget",
+                attempt + 1,
+                url,
+                _FETCH_DEADLINE_SECONDS,
+            )
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 return _FETCH_MISSING
@@ -202,10 +256,15 @@ def _save_snapshot_file(snapshot: dict) -> None:
 
 
 def _snapshot_is_fresh(snapshot: dict | None) -> bool:
-    return (
-        snapshot is not None
-        and (time.time() - float(snapshot.get("fetched_at", 0))) < _CACHE_TTL_SECONDS
+    if snapshot is None:
+        return False
+    # A failed main lookup (mappings or version) would otherwise hide the main install all day.
+    ttl = (
+        _CACHE_TTL_SECONDS
+        if snapshot.get("main_checked") and snapshot.get("main_version")
+        else _FAILURE_BACKOFF_SECONDS
     )
+    return (time.time() - float(snapshot.get("fetched_at", 0))) < ttl
 
 
 def _refresh_snapshot() -> dict | None:
@@ -222,6 +281,7 @@ def _refresh_snapshot() -> dict | None:
     if pypi_types is None:
         return None
     main_types = _fetch_remote_model_types("main")
+    main_version = _fetch_main_version() if main_types is not None else None
     return {
         "schema": _SNAPSHOT_SCHEMA,
         "fetched_at": time.time(),
@@ -229,6 +289,7 @@ def _refresh_snapshot() -> dict | None:
         "pypi_model_types": sorted(pypi_types),
         "main_model_types": sorted(main_types) if main_types is not None else [],
         "main_checked": main_types is not None,
+        "main_version": main_version,
     }
 
 
@@ -236,10 +297,13 @@ def _get_snapshot() -> dict | None:
     """Current support snapshot: memory -> disk -> network, with TTL and failure backoff.
 
     The network refresh runs outside the lock so a slow fetch cannot stall other
-    threads in the ASGI pool; _is_fetching deduplicates concurrent refreshes
-    (losers return None, the graceful fallthrough, rather than waiting).
+    threads in the ASGI pool; _is_fetching deduplicates concurrent refreshes, and a
+    loser waits (bounded) for the winner's answer rather than stacking a second fetch.
+    Waiting is what makes this safe to gate on: the Configure preview and the Start
+    button both ask, and a loser that answered "no answer" told the start there was no
+    upgrade, so the run launched on a model no installed transformers can load.
     """
-    global _memory_snapshot, _last_failure_at, _is_fetching
+    global _memory_snapshot, _last_failure_at, _is_fetching, _fetch_done
     with _lock:
         if _snapshot_is_fresh(_memory_snapshot):
             return _memory_snapshot
@@ -252,14 +316,28 @@ def _get_snapshot() -> dict | None:
         if time.time() - _last_failure_at < _FAILURE_BACKOFF_SECONDS:
             return None
         if _is_fetching:
-            return None
-        _is_fetching = True
+            in_flight = _fetch_done
+        else:
+            in_flight = None
+            _is_fetching = True
+            _fetch_done = done = threading.Event()
+    if in_flight is not None:
+        # Wait for the refresh's actual completion, not a clock: an expiry here means "still being fetched", which the
+        # callers above cannot tell from "no upgrade needed".
+        while not in_flight.wait(_INFLIGHT_WAIT_SECONDS):
+            with _lock:
+                if not _is_fetching or _fetch_done is not in_flight:
+                    break
+            logger.debug("Still waiting on the in-flight transformers support refresh")
+        with _lock:
+            return _memory_snapshot if _snapshot_is_fresh(_memory_snapshot) else None
     fresh = None
     try:
         fresh = _refresh_snapshot()
     finally:
         with _lock:
             _is_fetching = False
+            done.set()
             if fresh is None:
                 _last_failure_at = time.time()
             else:
@@ -278,9 +356,64 @@ def clear_caches() -> None:
         _memory_snapshot = None
         _last_failure_at = 0.0
         _is_fetching = False
+        _fetch_done.set()
     from utils.transformers_version import end_sidecar_swap
 
     end_sidecar_swap()
+
+
+# What unsloth_zoo strips to reach a bnb repo's full-precision base.
+_MLX_BNB_SUFFIXES = ("-unsloth-bnb-4bit", "-bnb-4bit")
+
+
+def _is_bitsandbytes_config(cfg: dict | None) -> bool:
+    """Whether *cfg* describes a bitsandbytes-quantized checkpoint."""
+    if not isinstance(cfg, dict):
+        return False
+    quant = cfg.get("quantization_config")
+    return isinstance(quant, dict) and quant.get("quant_method") == "bitsandbytes"
+
+
+def _mlx_swaps_bnb_repo_for_its_base(model_name: str) -> bool:
+    """Whether the MLX loader replaces this bnb Hub id with its base repo.
+
+    Mirrors unsloth_zoo's ``_remap_unsloth_bnb_hub_id_for_mlx``: only an
+    ``unsloth/`` Hub id is remapped, never a local directory. What it remaps, MLX
+    quantizes itself, so transformers never sees that architecture.
+    """
+    if not isinstance(model_name, str) or not model_name.startswith("unsloth/"):
+        return False
+    if os.path.exists(model_name):
+        return False
+    return model_name.endswith(_MLX_BNB_SUFFIXES)
+
+
+def _architecture_cannot_come_from_transformers(
+    model_name: str = "", cfg: dict | None = None
+) -> bool:
+    """Whether this host builds model architectures somewhere other than transformers.
+
+    The inference backend is chosen by hardware, and the MLX branch has no
+    transformers path to fall back to, so on MLX mlx-lm and mlx-vlm decide what
+    loads. Upgrading transformers cannot make an architecture loadable there, so
+    offering the install costs minutes and changes nothing.
+
+    One bitsandbytes repo is the exception. mlx-lm cannot read bnb weights, so the
+    MLX loader dequantizes them through ``AutoModelForCausalLM.from_pretrained``
+    -- transformers building the architecture after all -- and only an
+    ``unsloth/*-bnb-4bit`` Hub id is swapped for its base repo before that. A
+    third-party or local bnb repo therefore still fails inside transformers with
+    the unrecognized-architecture error this offer exists to fix, so it keeps it.
+    """
+    try:
+        from utils.hardware import DeviceType, get_device
+        if get_device() != DeviceType.MLX:
+            return False
+    except Exception:
+        return False
+    if _is_bitsandbytes_config(cfg) and not _mlx_swaps_bnb_repo_for_its_base(model_name):
+        return False
+    return True
 
 
 def latest_transformers_supports(model_type: str) -> dict | None:
@@ -302,6 +435,7 @@ def latest_transformers_supports(model_type: str) -> dict | None:
         "pypi_version": snapshot["pypi_version"],
         "supported_in_pypi": model_type in set(snapshot["pypi_model_types"]),
         "supported_in_main": model_type in set(snapshot["main_model_types"]),
+        "main_version": snapshot.get("main_version"),
     }
 
 
@@ -314,6 +448,27 @@ def _hardcoded_model_types() -> frozenset[str]:
     )
 
 
+# Pinned to 5.5 for its mlx-vlm processor, which has no model for the type: prompt even before the sidecar exists.
+_TIER_ROUTED_WITHOUT_MODEL = frozenset({"diffusion_gemma"})
+
+
+def _hardcoded_tier_ships(model_type: str) -> bool:
+    """A hardcoded tier counts as handling *model_type* unless that sidecar is installed and its
+    CONFIG_MAPPING lacks it: DiffusionGemma is routed to 5.5 for the mlx-vlm processor, but 5.5 has
+    no DiffusionGemma model, so a CUDA load needs the latest-transformers prompt."""
+    if model_type not in _hardcoded_model_types() or model_type in _TIER_ROUTED_WITHOUT_MODEL:
+        return False
+    for tier, types in (
+        ("530", _TRANSFORMERS_530_MODEL_TYPES),
+        ("550", _TRANSFORMERS_550_MODEL_TYPES),
+        ("510", _TRANSFORMERS_510_MODEL_TYPES),
+    ):
+        if model_type in types:
+            installed = _config_model_types(tier)
+            return not installed or model_type in installed
+    return True
+
+
 def check_upgrade_for_model(model_name: str, hf_token: str | None = None) -> dict | None:
     """Upgrade signal for *model_name*, or None when current routing already handles it.
 
@@ -322,6 +477,9 @@ def check_upgrade_for_model(model_name: str, hf_token: str | None = None) -> dic
     tables), i.e. exactly when today's load would fail with an unrecognized-architecture
     error. Returns ``{"model_type", "pypi_version", "supported_in_pypi",
     "supported_in_main"}`` when the newest transformers knows the type, else None.
+
+    Also None on a host that does not build architectures through transformers at
+    all -- see ``_architecture_cannot_come_from_transformers``.
 
     Never raises; every network touch is bounded and cached. Offline or with the
     ``UNSLOTH_STUDIO_NO_LATEST_TRANSFORMERS`` kill switch it returns None immediately.
@@ -332,23 +490,24 @@ def check_upgrade_for_model(model_name: str, hf_token: str | None = None) -> dic
         cfg = _load_config_json(model_name, hf_token)
         if not isinstance(cfg, dict):
             return None
+        if _architecture_cannot_come_from_transformers(model_name, cfg):
+            return None
         candidates = _model_types_from_config(cfg)
         if not candidates:
             return None
         # Without a readable base mapping every type looks brand new; bail out.
         if not _config_model_types("default"):
             return None
-        hardcoded = _hardcoded_model_types()
         missing = [
             candidate
             for candidate in candidates
-            if candidate not in hardcoded
+            if not _hardcoded_tier_ships(candidate)
             and not any(candidate in _config_model_types(tier) for tier in _TIER_RANK)
         ]
         if not missing:
             return None
-        # Latest must load EVERY missing type (wrappers build nested sub-configs
-        # through CONFIG_MAPPING) or the load still fails.
+        # Latest must load EVERY missing type (wrappers build nested sub-configs through CONFIG_MAPPING) or the load
+        # still fails.
         supports = [latest_transformers_supports(candidate) for candidate in missing]
         if any(
             s is None or not (s["supported_in_pypi"] or s["supported_in_main"]) for s in supports
@@ -373,17 +532,15 @@ def check_upgrade_for_model(model_name: str, hf_token: str | None = None) -> dic
             "pypi_version": supports[0]["pypi_version"],
             "supported_in_pypi": supported_in_pypi,
             "supported_in_main": supported_in_main,
+            "main_version": supports[0].get("main_version"),
         }
     except Exception as exc:
         logger.debug("Latest-transformers check failed for '%s': %s", model_name, exc)
         return None
 
 
-# --- Dependency compatibility preflight ------------------------------------------------------
 # Sidecars install transformers --no-deps atop the base env. Before installing, compare
 # requires_dist: unsatisfied shadowable deps become exact --target pins, anything else blocks.
-
-# Safe to shadow inside the sidecar dir (pure wheels, no torch coupling).
 _SHADOWABLE_DEPS = frozenset({"tokenizers", "safetensors"})
 # Provided by the sidecar recipe; checked against its pin, not the base env.
 _SIDECAR_PROVIDED = {"huggingface-hub": "1.8.0", "hf-xet": "1.4.2"}
@@ -393,6 +550,59 @@ _IGNORED_DEPS = frozenset({"typer"})
 
 def _canonical_dep_name(name: str) -> str:
     return name.lower().replace("_", "-")
+
+
+_MAIN_RAW = "https://raw.githubusercontent.com/huggingface/transformers/main"
+
+
+def _fetch_main_version(ref: str = "main") -> str | None:
+    """``__version__`` on transformers *ref* (a ``.devN`` string), or None."""
+    from utils.transformers_version import _is_valid_version_string
+
+    body = _fetch_text(f"{_MAIN_RAW.rsplit('/', 1)[0]}/{ref}/src/transformers/__init__.py")
+    if body is None or body == _FETCH_MISSING:
+        return None
+    match = re.search(r'^__version__\s*=\s*"([^"]+)"', body, re.MULTILINE)
+    if (
+        match is None
+        or ".dev" not in match.group(1)
+        or not _is_valid_version_string(match.group(1))
+    ):
+        return None
+    return match.group(1)
+
+
+_MAIN_REFS = "https://github.com/huggingface/transformers.git/info/refs?service=git-upload-pack"
+
+
+def _resolve_main_commit() -> str | None:
+    """The commit main points at, from git's ref advertisement (not the rate-limited API)."""
+    body = _fetch_text(_MAIN_REFS)
+    if body is None or body == _FETCH_MISSING:
+        return None
+    match = re.search(r"([0-9a-f]{40}) refs/heads/main(?:\x00|\n)", body)
+    return match.group(1) if match else None
+
+
+def _fetch_main_requires() -> list[str] | None:
+    """Core install_requires of transformers main (at the commit being installed), from setup.py."""
+    from utils import transformers_version as tv
+
+    ref = tv._main_archive_commit or "main"
+    body = _fetch_text(f"{_MAIN_RAW.rsplit('/', 1)[0]}/{ref}/setup.py")
+    if body is None or body == _FETCH_MISSING:
+        return None
+    deps_block = re.search(r"^_deps = \[(.*?)^\]", body, re.MULTILINE | re.DOTALL)
+    install_block = re.search(r"^install_requires = \[(.*?)^\]", body, re.MULTILINE | re.DOTALL)
+    if deps_block is None or install_block is None:
+        return None
+    deps = {}
+    for spec in re.findall(r'"([^"]+)"', deps_block.group(1)):
+        deps[re.split(r"[<>=!~ \[;]", spec, maxsplit = 1)[0]] = spec
+    names = re.findall(r'deps\["([^"]+)"\]', install_block.group(1))
+    if not names or any(name not in deps for name in names):
+        return None
+    return [deps[name] for name in names]
 
 
 def _fetch_requires_dist(version: str) -> list[str] | None:
@@ -444,7 +654,7 @@ def compat_plan(version: str) -> tuple[tuple[str, ...], list[str]]:
     install: proceeding unverified could pin a sidecar whose imports then crash the
     workers, and the caller just reached PyPI for the version check so a retry is cheap.
     """
-    reqs = _fetch_requires_dist(version)
+    reqs = _fetch_main_requires() if ".dev" in version else _fetch_requires_dist(version)
     if reqs is None:
         return (), ["dependency metadata for this release (could not be fetched from PyPI; retry)"]
     try:
@@ -467,7 +677,15 @@ def compat_plan(version: str) -> tuple[tuple[str, ...], list[str]]:
             continue
         if name in _SIDECAR_PROVIDED:
             if not req.specifier.contains(_SIDECAR_PROVIDED[name], prereleases = True):
-                blockers.append(raw)
+                # studio.txt already ships a newer hub: pin the base env's hub + hf-xet pair instead.
+                base_pins = _base_env_sidecar_pins()
+                base_name_pin = next((p for p in base_pins if p.startswith(f"{name}==")), None)
+                if base_name_pin and req.specifier.contains(
+                    base_name_pin.split("==", 1)[1], prereleases = True
+                ):
+                    extras.extend(p for p in base_pins if p not in extras)
+                else:
+                    blockers.append(raw)
             continue
         try:
             installed = _installed_version(req.name)
@@ -484,6 +702,20 @@ def compat_plan(version: str) -> tuple[tuple[str, ...], list[str]]:
         else:
             blockers.append(raw)
     return tuple(extras), blockers
+
+
+def _base_env_sidecar_pins() -> list[str]:
+    """Exact pins of the base env's own huggingface-hub and hf-xet (empty if either is missing)."""
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _installed_version
+
+    pins = []
+    for name in _SIDECAR_PROVIDED:
+        try:
+            pins.append(f"{name}=={_installed_version(name)}")
+        except PackageNotFoundError:
+            return []
+    return pins
 
 
 def is_install_in_progress() -> bool:
@@ -556,26 +788,53 @@ def _install_latest_transformers_locked(version: str, before_swap = None) -> dic
             "version": version,
             "message": "Could not verify the latest transformers release on PyPI.",
         }
-    if version != snapshot["pypi_version"]:
+    from_main = (
+        version != snapshot["pypi_version"]
+        and snapshot.get("main_checked")
+        and version == snapshot.get("main_version")
+    )
+    if version != snapshot["pypi_version"] and not from_main:
         return {
             "success": False,
             "version": version,
             "message": f"Requested version {version!r} is not the latest transformers "
             f"release ({snapshot['pypi_version']}).",
-            # Lets the consent dialog retry with the release that superseded the
-            # one /validate saw, instead of re-sending the stale version forever.
+            # Retry uses these instead of re-sending the stale version forever.
             "latest_version": snapshot["pypi_version"],
+            "latest_main_version": snapshot.get("main_version"),
         }
-    extra_packages, blockers = compat_plan(version)
-    if blockers:
+    main_commit = current_main = None
+    if from_main:
+        # Check the version at one commit and install that commit, so main cannot move between.
+        main_commit = _resolve_main_commit()
+        current_main = _fetch_main_version(main_commit) if main_commit else None
+    if from_main and current_main != version:
         return {
             "success": False,
             "version": version,
-            "message": "Cannot install transformers "
-            f"{version}: this environment does not satisfy {', '.join(blockers)}. "
-            "An Unsloth update is required first.",
+            "message": f"transformers main is no longer {version}; retry to install the current main."
+            if current_main
+            else "Could not check transformers main; retry.",
+            "latest_version": snapshot["pypi_version"],
+            "latest_main_version": current_main,
         }
-    if not ensure_latest_transformers_venv(version, extra_packages, before_swap = before_swap):
+    from utils.transformers_version import transformers_main_at
+
+    # Requirements and archive both come from the pinned commit.
+    with transformers_main_at(main_commit) if main_commit else contextlib.nullcontext():
+        extra_packages, blockers = compat_plan(version)
+        if blockers:
+            return {
+                "success": False,
+                "version": version,
+                "message": "Cannot install transformers "
+                f"{version}: this environment does not satisfy {', '.join(blockers)}. "
+                "An Unsloth update is required first.",
+            }
+        installed = ensure_latest_transformers_venv(
+            version, extra_packages, before_swap = before_swap
+        )
+    if not installed:
         return {
             "success": False,
             "version": version,
@@ -585,7 +844,7 @@ def _install_latest_transformers_locked(version: str, before_swap = None) -> dic
     return {
         "success": True,
         "version": version,
-        "message": f"Installed transformers {version} into the latest sidecar "
+        "message": f"Installed transformers {version}{' (main)' if from_main else ''} into the latest sidecar "
         f"(pinned: {latest_venv_pinned_version()}).",
     }
 

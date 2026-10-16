@@ -31,6 +31,10 @@ pub const TAIL_MAX_LINES: usize = 1000;
 pub const TAIL_MAX_BYTES: usize = 200 * 1024;
 pub const REPORT_MAX_BYTES: usize = 1024 * 1024;
 
+pub(crate) fn redact_for_display(text: &str) -> String {
+    redaction::redact_text(text, &mut redaction::RedactionReport::default())
+}
+
 pub(crate) const MAX_STATE_ITEMS: usize = 200;
 pub(crate) const MAX_PHASE_LINE_BYTES: usize = 16 * 1024;
 pub(crate) const FOOTER_BUDGET_BYTES: usize = 8 * 1024;
@@ -49,11 +53,25 @@ pub(crate) fn new_id(prefix: &str) -> String {
     format!("{}-{}-{}", sanitize_component(prefix), now_ms(), n)
 }
 
+/// A chosen root only once it exists: creating it here would stop install.ps1 claiming it.
 pub fn studio_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".unsloth")
-        .join("studio")
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    crate::studio_home::chosen_root_for_home(&home)
+        .filter(|root| root.is_dir())
+        .unwrap_or_else(|| crate::studio_home::default_root_for_home(&home))
+}
+
+/// Plus the default root while a chosen one is in use: a first install logs there until it exists.
+pub fn log_roots() -> Vec<PathBuf> {
+    let current = studio_dir();
+    let mut roots = vec![current.clone()];
+    if let Some(home) = dirs::home_dir() {
+        let default = crate::studio_home::default_root_for_home(&home);
+        if default != current && default.is_dir() {
+            roots.push(default);
+        }
+    }
+    roots
 }
 
 pub fn logs_dir() -> PathBuf {
@@ -130,10 +148,7 @@ async fn collect_backend_health(port: u16) -> report::BackendHealthSection {
         fields: Vec::new(),
         warning: None,
     };
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_millis(750))
-        .build()
-    {
+    let client = match crate::loopback_http::client(Duration::from_millis(750)) {
         Ok(client) => client,
         Err(error) => {
             section.warning = Some(format!("health client unavailable: {error}"));

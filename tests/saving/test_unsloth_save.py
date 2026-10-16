@@ -7,27 +7,22 @@ import importlib
 
 from unsloth import FastLanguageModel, FastModel
 
+# Every param downloads and merges a checkpoint on the accelerator; CI runs it under `-m gpu`.
+pytestmark = pytest.mark.gpu
+
+# One model per save path, the smallest that still exercises it: this file runs in the default
+# `pytest tests/` walk, so every entry is paid by anyone running the suite.
 model_to_test = [
-    # Text models
-    "unsloth/tinyllama",
-    "unsloth/tinyllama-bnb-4bit",
     "unsloth/Qwen2.5-0.5B-Instruct",
-    "unsloth/Qwen2.5-0.5B-Instruct-bnb-4bit",
-    "unsloth/Phi-4-mini-instruct",
-    "unsloth/Phi-4-mini-instruct-bnb-4bit",
-    "unsloth/Qwen2.5-0.5B",
-    # Vision models
-    "unsloth/gemma-3-4b-it",
-    "unsloth/Llama-3.2-11B-Vision-Instruct-bnb-4bit",
+    # Pre-quantized checkpoint: the merge must dequantize back out of it.
+    "unsloth/tinyllama-bnb-4bit",
+    # The only entry whose merged output exceeds the 5GB shard limit, so it alone covers sharded output
+    # in a default run. Keep an entry above 5GB here.
     "unsloth/Qwen2.5-VL-3B-Instruct-bnb-4bit",
 ]
 
 torchao_models = [
-    "unsloth/tinyllama",
     "unsloth/Qwen2.5-0.5B-Instruct",
-    # "unsloth/Phi-4-mini-instruct",
-    # "unsloth/Qwen2.5-0.5B",
-    # Skip the -bnb-4bit variants since they're already quantized
 ]
 
 
@@ -48,7 +43,7 @@ def loaded_model_tokenizer(request):
     print("Loading model and tokenizer...")
 
     model, tokenizer = FastModel.from_pretrained(
-        model_name,  # use small model
+        model_name,
         max_seq_length = 128,
         dtype = None,
         load_in_4bit = True,
@@ -75,7 +70,7 @@ def fp16_model_tokenizer(request):
         model_name,
         max_seq_length = 128,
         dtype = None,
-        load_in_4bit = False,  # no BnB quantization
+        load_in_4bit = False,
     )
 
     model = FastModel.get_peft_model(
@@ -143,7 +138,6 @@ def test_save_merged_16bit(model, tokenizer, temp_save_dir: str):
             os.path.join(save_path, file)
         ), f"{file} not found in the save directory."
 
-    # 16bit means no quantization config.
     config_path = os.path.join(save_path, "config.json")
     with open(config_path, "r") as f:
         config = json.load(f)
@@ -193,7 +187,6 @@ def test_save_merged_4bit(model, tokenizer, temp_save_dir: str):
         total_size < save_file_sizes["merged_16bit"][model.config._name_or_path]
     ), "Merged 4bit files are larger than merged 16bit files."
 
-    # 4bit means there's a quantization config.
     config_path = os.path.join(save_path, "config.json")
     with open(config_path, "r") as f:
         config = json.load(f)
@@ -262,8 +255,6 @@ def test_save_torchao(fp16_model_tokenizer, temp_save_dir: str):
 
     assert "quantization_config" in config, "Quantization config not found in the model config."
 
-    # load_in_4bit must stay False: a torchao-quantized model can't be
-    # re-quantized with bitsandbytes.
     import torch.serialization
 
     with torch.serialization.safe_globals([getattr]):
@@ -304,6 +295,7 @@ def test_save_and_inference_torchao(fp16_model_tokenizer, temp_save_dir: str):
         torchao_save_path
     ), f"TorchAO directory {torchao_save_path} does not exist."
 
+    # load_in_4bit must stay False: a torchao-quantized model cannot be re-quantized with bitsandbytes.
     import torch.serialization
 
     with torch.serialization.safe_globals([getattr]):
@@ -325,14 +317,14 @@ def test_save_and_inference_torchao(fp16_model_tokenizer, temp_save_dir: str):
     inputs = loaded_tokenizer.apply_chat_template(
         messages,
         tokenize = True,
-        add_generation_prompt = True,  # required for generation
+        add_generation_prompt = True,
         return_tensors = "pt",
     ).to("cuda")
 
     outputs = loaded_model.generate(
         input_ids = inputs,
         max_new_tokens = 64,
-        use_cache = False,  # avoid cache issues
+        use_cache = False,
         temperature = 1.5,
         min_p = 0.1,
         do_sample = True,

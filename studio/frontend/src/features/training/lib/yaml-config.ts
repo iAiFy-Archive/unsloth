@@ -4,6 +4,7 @@
 import * as yaml from "js-yaml";
 import type { BackendModelConfig } from "../api/models-api";
 import type { TrainingConfigState } from "../types/config";
+import { drafterRequestFrom } from "./drafter-config";
 
 const EXPECTED_TOP_KEYS = new Set(["training", "lora", "logging", "inference"]);
 
@@ -27,10 +28,9 @@ export function parseYamlConfig(text: string): BackendModelConfig {
     console.warn("Ignored unknown YAML keys:", unknownKeys.join(", "));
   }
 
-  // File import is authoritative: force vision_image_size = null when the
-  // training section is missing/malformed/lacks the key, so a stale store
-  // value can't survive an import. (Same-model defaults reloads preserve
-  // user choice via Object.hasOwn in model-defaults.ts.)
+  // File import is authoritative: force vision_image_size = null when the training section is
+  // missing/malformed/lacks the key, so a stale store value can't survive an import. (Same-model
+  // defaults reloads preserve user choice via Object.hasOwn in model-defaults.ts.)
   const rawTraining = raw.training;
   const isPlainTrainingObject =
     rawTraining != null &&
@@ -83,20 +83,30 @@ export function serializeConfigToYaml(
     max_seq_length: state.contextLength,
     num_epochs: state.epochs,
     learning_rate: state.learningRate,
+    embedding_learning_rate: state.embeddingLearningRate,
     batch_size: state.batchSize,
     gradient_accumulation_steps: state.gradientAccumulation,
     warmup_steps: state.warmupSteps,
     max_steps: state.maxSteps,
     save_steps: state.saveSteps,
     eval_steps: state.evalSteps,
+    early_stopping_patience: state.earlyStoppingPatience,
     weight_decay: state.weightDecay,
     random_seed: state.randomSeed,
     packing: state.packing,
     train_on_completions: state.trainOnCompletions,
     gradient_checkpointing: state.gradientCheckpointing,
+    offload_layers: state.offloadLayers,
+    offload_vram_gb: state.offloadVramGb,
+    offload_vram_gb_per_device: state.offloadVramGbPerDevice,
+    prefetch_depth: state.prefetchDepth,
     optim: state.optimizerType,
     lr_scheduler_type: state.lrSchedulerType,
   };
+  // Only when on, so a file exported without the feature reads exactly as before.
+  if (state.drafterEnabled) {
+    training.drafter = drafterRequestFrom(state);
+  }
 
   if (includeVisionImageSize) {
     training.vision_image_size = state.visionImageSize;
@@ -105,6 +115,14 @@ export function serializeConfigToYaml(
   const config = {
     training,
     lora,
+    // Include every non-secret logging field read by parseYamlConfig.
+    logging: {
+      enable_wandb: state.enableWandb,
+      wandb_project: state.wandbProject,
+      enable_tensorboard: state.enableTensorboard,
+      tensorboard_dir: state.tensorboardDir,
+      log_frequency: state.logFrequency,
+    },
   };
 
   return yaml.dump(config, { lineWidth: -1, noRefs: true });

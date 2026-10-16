@@ -1,3 +1,15 @@
+# tests/saving scripts run their whole body at import, so skip collection unless opted in.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
+from tests.utils.os_utils import require_opt_in as _require_opt_in
+
+_require_opt_in(
+    "UNSLOTH_RUN_SAVING_SCRIPTS",
+    "GPU + Hub saving script; its body runs at import.",
+)
+
 from unsloth import FastLanguageModel, FastModel
 from transformers import CsmForConditionalGeneration
 import torch
@@ -96,7 +108,7 @@ print("🔍 SECTION 4: Saving and Merging Model")
 print(f"{'='*80}")
 
 with warnings.catch_warnings():
-    warnings.simplefilter("error")  # treat warnings as errors so saving stays clean
+    warnings.simplefilter("error")
     try:
         model.save_pretrained_merged("csm", tokenizer)
         print("✅ Model saved and merged successfully without warnings!")
@@ -129,7 +141,6 @@ print(f"{'='*80}")
 
 
 from transformers import pipeline
-import torch
 
 output_audio_path = "csm_audio.wav"
 try:

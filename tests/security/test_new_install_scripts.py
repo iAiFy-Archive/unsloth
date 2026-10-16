@@ -1,8 +1,4 @@
-"""Regression tests for `scripts/check_new_install_scripts.py`.
-
-Lockfiles are tiny dicts in tmp_path; the network_blocker fixture forces the
-scanner's offline path (registry unreachable -> emit finding anyway).
-"""
+"""Tests for scripts/check_new_install_scripts.py; network_blocker forces its offline path."""
 
 from __future__ import annotations
 
@@ -41,7 +37,6 @@ def _write(path: Path, content: dict) -> Path:
     return path
 
 
-# Lockfile fixtures
 def _v3_lockfile(packages: dict) -> dict:
     return {
         "name": "unsloth-theme",
@@ -63,7 +58,6 @@ def _v2_lockfile(packages: dict, dependencies: dict) -> dict:
     }
 
 
-# Tests
 def test_no_new_install_scripts_exit_0(tmp_path: Path):
     """If base == head, nothing new can have been added."""
     same = _v3_lockfile(
@@ -121,7 +115,6 @@ def test_existing_dep_with_postinstall_ignored(tmp_path: Path):
             "integrity": "sha512-fake",
             "hasInstallScript": True,
         },
-        # Transitive install-script copy, nested under another dep.
         "node_modules/some-build-pkg/node_modules/node-gyp": {
             "version": "10.0.1",
             "resolved": "https://registry.npmjs.org/node-gyp/-/node-gyp-10.0.1.tgz",
@@ -130,7 +123,6 @@ def test_existing_dep_with_postinstall_ignored(tmp_path: Path):
         },
     }
     head_pkgs = dict(base_pkgs)
-    # Add an unrelated non-install-script dep in head.
     head_pkgs["node_modules/lodash"] = {
         "version": "4.17.21",
         "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
@@ -143,7 +135,6 @@ def test_existing_dep_with_postinstall_ignored(tmp_path: Path):
         f"expected exit 0, got {result.returncode}; stderr:\n{result.stderr}\n"
         f"stdout:\n{result.stdout}"
     )
-    # Sanity: the existing node-gyp must NOT be reported.
     assert "node-gyp" not in result.stderr
 
 
@@ -181,7 +172,6 @@ def test_v2_v3_lockfile_format_support(tmp_path: Path):
     )
     assert "v2-postinstall-dep" in result.stderr
 
-    # Same packages as lockfileVersion 3 must give the same finding.
     base_v3 = _write(tmp_path / "base_v3.json", _v3_lockfile(base_pkgs))
     head_v3 = _write(tmp_path / "head_v3.json", _v3_lockfile(head_pkgs))
     result_v3 = _run(base_v3, head_v3)

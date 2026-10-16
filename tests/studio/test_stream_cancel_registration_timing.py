@@ -1,15 +1,11 @@
-"""Cancel tracker must register BEFORE StreamingResponse returns and clean up
-in each async generator's `finally`, else a Stop before the first SSE chunk
-leaves a zombie decode (a BackgroundTask would be skipped when stream_response raises).
-
-Structural verifies registration placement and try/finally cleanup; behavioral
-verifies the extracted `_TrackedCancel` cleans up across completion/OSError/aclose
-and that a pre-set cancel_event breaks the GGUF loop cleanly with final_chunk + [DONE]."""
+"""Cancel tracker must register before StreamingResponse returns, or a Stop leaves a zombie decode."""
 
 from __future__ import annotations
 
 import ast
 import asyncio
+import importlib.util
+import sys
 import json
 import threading
 import time
@@ -19,9 +15,6 @@ from pathlib import Path
 SOURCE_PATH = Path(__file__).resolve().parents[2] / "studio" / "backend" / "routes" / "inference.py"
 SRC = SOURCE_PATH.read_text(encoding = "utf-8")
 _TREE = ast.parse(SRC)
-
-
-# ── Structural (AST) helpers ─────────────────────────────────
 
 
 def _collect_async_functions(tree: ast.AST):
@@ -75,9 +68,6 @@ def _calls_name(node: ast.AST, name: str) -> bool:
     return False
 
 
-# ── Structural tests ─────────────────────────────────────────
-
-
 def test_no_tracker_enter_inside_async_generators():
     offenders = []
     for fn in _collect_async_functions(_TREE):
@@ -99,10 +89,10 @@ def test_no_tracker_enter_inside_async_generators():
 def test_tracker_enter_exists_in_sync_body_of_chat_completions():
     top = None
     for n in ast.walk(_TREE):
-        if isinstance(n, ast.AsyncFunctionDef) and n.name == "openai_chat_completions":
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "produce_openai_chat_completions":
             top = n
             break
-    assert top is not None, "openai_chat_completions handler missing"
+    assert top is not None, "produce_openai_chat_completions handler missing"
     count = 0
     for sub in ast.walk(top):
         if not isinstance(sub, ast.Call):
@@ -116,7 +106,7 @@ def test_tracker_enter_exists_in_sync_body_of_chat_completions():
         ):
             count += 1
     assert count >= 3, (
-        f"expected >=3 _tracker.__enter__() calls in openai_chat_completions "
+        f"expected >=3 _tracker.__enter__() calls in produce_openai_chat_completions "
         f"(one per streaming path), got {count}"
     )
 
@@ -146,8 +136,26 @@ def test_async_generators_cleanup_tracker_in_finally():
     )
 
 
+_SAME_TASK_BUILDERS = ("_SameTaskStreamingResponse", "_sse_streaming_response")
+
+
+def test_sse_streaming_response_builds_a_same_task_response():
+    fn = next(
+        n
+        for n in ast.walk(_TREE)
+        if isinstance(n, ast.FunctionDef) and n.name == "_sse_streaming_response"
+    )
+    names = {
+        sub.func.id
+        for sub in ast.walk(fn)
+        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+    }
+    assert "_SameTaskStreamingResponse" in names
+    assert "StreamingResponse" not in names
+
+
 def test_chat_completions_streams_avoid_starlette_task_group():
-    top = _async_function("openai_chat_completions")
+    top = _async_function("produce_openai_chat_completions")
     legacy_calls = []
     same_task_calls = 0
     for sub in ast.walk(top):
@@ -155,7 +163,7 @@ def test_chat_completions_streams_avoid_starlette_task_group():
             continue
         if sub.func.id == "StreamingResponse":
             legacy_calls.append(sub.lineno)
-        if sub.func.id == "_SameTaskStreamingResponse":
+        if sub.func.id in _SAME_TASK_BUILDERS:
             same_task_calls += 1
     assert not legacy_calls, (
         "Streaming /v1/chat/completions must use _SameTaskStreamingResponse, "
@@ -178,7 +186,7 @@ def test_openai_passthrough_stream_avoids_starlette_task_group():
                 continue
             if sub.func.id == "StreamingResponse":
                 legacy_calls.append(sub.lineno)
-            if sub.func.id == "_SameTaskStreamingResponse":
+            if sub.func.id in _SAME_TASK_BUILDERS:
                 same_task_calls += 1
     assert not legacy_calls, (
         "OpenAI passthrough streams must use _SameTaskStreamingResponse, "
@@ -189,7 +197,7 @@ def test_openai_passthrough_stream_avoids_starlette_task_group():
 
 
 def test_local_chat_streams_install_same_task_disconnect_watcher():
-    top = _async_function("openai_chat_completions")
+    top = _async_function("produce_openai_chat_completions")
     assert _calls_name(top, "_await_disconnect_then_cancel"), (
         "Local same-task streams must watch request disconnects themselves; "
         "do not restore Starlette's task-group StreamingResponse for this."
@@ -242,8 +250,6 @@ def test_audio_input_stream_installs_disconnect_watcher():
     assert has_cleanup, "audio_input_stream must stop its disconnect watcher in finally"
 
 
-# ── Behavioral helpers ───────────────────────────────────────
-
 _WANTED = {
     "_CANCEL_REGISTRY",
     "_CANCEL_LOCK",
@@ -251,31 +257,61 @@ _WANTED = {
     "_PENDING_CANCEL_TTL_S",
     "_prune_pending",
     "_TrackedCancel",
+    "_slot_lock",
     "_cancel_by_keys",
     "_cancel_by_cancel_id_or_stash",
 }
 
 
-def _load_registry_module():
+def _load_active_generations():
+    """Loads the real registry from disk, not via import, to avoid pulling in the route package."""
+    path = SOURCE_PATH.parents[1] / "state" / "active_generations.py"
+    spec = importlib.util.spec_from_file_location("studio_active_generations", path)
+    module = importlib.util.module_from_spec(spec)
+    backend = str(SOURCE_PATH.parents[1])
+    sys.path.insert(0, backend)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(backend)
+    return module
+
+
+_REGISTRY_SOURCE = None
+
+
+def _registry_source():
+    """Built once per process: only the kept top-level nodes are cut, since get_source_segment is slow."""
+    global _REGISTRY_SOURCE
+    if _REGISTRY_SOURCE is not None:
+        return _REGISTRY_SOURCE
     chunks = []
     for n in _TREE.body:
+        if isinstance(n, (ast.FunctionDef, ast.ClassDef)):
+            wanted = n.name in _WANTED
+        elif isinstance(n, ast.Assign):
+            wanted = any(t.id in _WANTED for t in n.targets if isinstance(t, ast.Name))
+        elif isinstance(n, ast.AnnAssign):
+            wanted = isinstance(n.target, ast.Name) and n.target.id in _WANTED
+        else:
+            wanted = False
+        if not wanted:
+            continue
         seg = ast.get_source_segment(SRC, n)
         if seg is None:
             continue
-        if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in _WANTED:
-            chunks.append(seg)
-        elif isinstance(n, ast.Assign):
-            names = [t.id for t in n.targets if isinstance(t, ast.Name)]
-            if any(name in _WANTED for name in names):
-                chunks.append(seg)
-        elif (
-            isinstance(n, ast.AnnAssign)
-            and isinstance(n.target, ast.Name)
-            and n.target.id in _WANTED
-        ):
-            chunks.append(seg)
-    mod = {}
-    exec("import threading, time\n" + "\n\n".join(chunks), mod)
+        chunks.append(seg)
+    _REGISTRY_SOURCE = "\n\n".join(chunks)
+    return _REGISTRY_SOURCE
+
+
+def _load_registry_module():
+    mod = {"active_generations": _load_active_generations()}
+    exec(
+        'import contextvars\nrouted_slot = contextvars.ContextVar("routed_slot", default = None)\n'
+        "import threading, time\n_account_cancel_key = lambda key: key\n" + _registry_source(),
+        mod,
+    )
     return mod
 
 
@@ -325,8 +361,6 @@ async def _consume(agen):
 
 
 def _llama_stub_raises_on_preset_cancel(cancel_event):
-    # Reproduces llama_cpp.py _stream_with_retry `raise GeneratorExit` when
-    # cancel_event is already set at entry.
     if cancel_event.is_set():
         raise GeneratorExit
     yield "cumulative-1"
@@ -348,9 +382,6 @@ async def _post_fix_gguf_loop(cancel_event):
     yield "[DONE]"
 
 
-# ── Behavioral tests ─────────────────────────────────────────
-
-
 def test_finally_cleanup_on_normal_completion():
     m = _load_registry_module()
     m["_CANCEL_REGISTRY"].clear()
@@ -365,8 +396,6 @@ def test_finally_cleanup_on_normal_completion():
 
 
 def test_finally_cleanup_on_mid_stream_exception():
-    # OSError mid-stream: the exact case where pre-fix `background=BackgroundTask(...)`
-    # was skipped and leaked the registry entry.
     m = _load_registry_module()
     m["_CANCEL_REGISTRY"].clear()
     ev = threading.Event()
@@ -379,7 +408,6 @@ def test_finally_cleanup_on_mid_stream_exception():
 
 
 def test_finally_cleanup_on_aclose():
-    # Starlette calls aclose() on client disconnect; the finally block must run.
     m = _load_registry_module()
     m["_CANCEL_REGISTRY"].clear()
     ev = threading.Event()
@@ -415,7 +443,7 @@ def test_same_task_response_closes_body_iterator_on_send_disconnect():
         response = m["_SameTaskStreamingResponse"].__new__(m["_SameTaskStreamingResponse"])
         response.body_iterator = agen
         response.background = None
-        # __new__ bypasses __init__; __call__'s disconnect branch reads _unstarted_cleanup.
+        # __new__ bypasses __init__, but the disconnect branch reads _unstarted_cleanup.
         response._unstarted_cleanup = None
 
         async def stream_response(_send):
@@ -434,8 +462,6 @@ def test_same_task_response_closes_body_iterator_on_send_disconnect():
 
 
 def test_preset_cancel_event_exits_cleanly_with_done():
-    # Pending-replay: a stashed cancel pre-set cancel_event. The loop must break
-    # cleanly with final_chunk + [DONE], not propagate GeneratorExit from the GGUF wrapper.
     ev = threading.Event()
     ev.set()
     chunks = asyncio.run(_consume(_post_fix_gguf_loop(ev)))
@@ -448,14 +474,12 @@ def test_preset_cancel_event_exits_cleanly_with_done():
 
 
 def test_normal_path_streams_all_tokens():
-    # Regression: the top-of-loop cancel_event check must not short-circuit when unset.
     ev = threading.Event()
     chunks = asyncio.run(_consume(_post_fix_gguf_loop(ev)))
     assert chunks == ["first_chunk", "cumulative-1", "cumulative-2", "final_chunk", "[DONE]"]
 
 
 def test_cancel_during_streaming_stops_iteration_promptly():
-    # Setting cancel_event between yields breaks on the next iteration, not draining the generator.
     ev = threading.Event()
 
     async def _run():
@@ -475,12 +499,8 @@ def test_cancel_during_streaming_stops_iteration_promptly():
     assert "[DONE]" in seen
 
 
-# ── Cancel-event responsiveness in the streaming loops ───────
-
-
 def _loop_has_cancel_event_check(fn) -> bool:
-    # An `if cancel_event.is_set():` inside a loop body is sufficient -- without it
-    # a cancel POST can't interrupt, since Colab-style proxies drop request.is_disconnected().
+    # Colab-style proxies drop request.is_disconnected(), so only cancel_event can interrupt.
     for sub in ast.walk(fn):
         if not isinstance(sub, (ast.While, ast.For, ast.AsyncFor)):
             continue
@@ -521,8 +541,6 @@ def test_streaming_generators_check_cancel_event_in_loop():
 
 
 def test_audio_input_stream_offloads_blocking_next_to_thread():
-    # Guards against regressing to `for chunk_text in audio_input_generate():`, which
-    # blocks the event loop per whisper chunk and stalls POST /api/inference/cancel.
     audio = None
     for fn in ast.walk(_TREE):
         if isinstance(fn, ast.AsyncFunctionDef) and fn.name == "audio_input_stream":
@@ -674,16 +692,16 @@ def test_generate_stream_cancels_backend_on_stream_cancelled_error():
             body_src = "\n".join(ast.unparse(stmt) for stmt in sub.body)
             found_cancel_handler = (
                 "cancel_event.set()" in body_src
-                and "backend.reset_generation_state()" in body_src
+                and "backend.reset_generation_state(cancel_event)" in body_src
                 and any(isinstance(stmt, ast.Raise) and stmt.exc is None for stmt in sub.body)
             )
         if isinstance(sub, ast.Try) and sub.finalbody:
             final_src = "\n".join(ast.unparse(stmt) for stmt in sub.finalbody)
-            found_finally_cleanup = (
+            found_finally_cleanup = found_finally_cleanup or (
                 "not completed" in final_src
                 and "not cancel_event.is_set()" in final_src
                 and "cancel_event.set()" in final_src
-                and "backend.reset_generation_state()" in final_src
+                and "backend.reset_generation_state(cancel_event)" in final_src
                 and _awaits_to_thread_gen_close(sub)
             )
 
@@ -703,12 +721,10 @@ def test_generate_stream_cancels_backend_on_stream_cancelled_error():
 
 
 def test_stream_chunks_cancel_branch_resets_backend_state():
-    # The cancel branch must call backend.reset_generation_state() to flush
-    # GPU/KV-cache state, else cancel-via-POST leaves the subprocess dirty.
     fn = None
     top = None
     for n in ast.walk(_TREE):
-        if isinstance(n, ast.AsyncFunctionDef) and n.name == "openai_chat_completions":
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "produce_openai_chat_completions":
             top = n
             break
     assert top is not None
@@ -731,17 +747,14 @@ def test_stream_chunks_cancel_branch_resets_backend_state():
         ):
             continue
         body_src = "\n".join(ast.unparse(s) for s in sub.body)
-        if "backend.reset_generation_state()" in body_src:
+        if "backend.reset_generation_state(cancel_event)" in body_src:
             return
     raise AssertionError(
         "stream_chunks `if cancel_event.is_set():` branch must call "
-        "backend.reset_generation_state() -- matches the existing "
+        "backend.reset_generation_state(cancel_event) -- matches the existing "
         "request.is_disconnected() / CancelledError cleanup paths and "
         "prevents KV-cache drift after cancel-via-POST"
     )
-
-
-# ── Behavioral simulations for the iter-1 fixes ──────────────
 
 
 def test_unsloth_stream_loop_breaks_on_external_cancel_event():
@@ -792,8 +805,6 @@ def test_unsloth_stream_loop_breaks_on_external_cancel_event():
 
 
 def test_generate_stream_stays_responsive_under_blocking_next():
-    # Same sync-generator shape as generate_stream, with resp_queue.get modeled
-    # by sleep. The output must stay unchanged while next() moves off-loop.
     chunks = ["alpha", "beta", "gamma", "delta"]
 
     def _generate_chat_response():
@@ -892,8 +903,6 @@ def test_generate_stream_stays_responsive_under_blocking_next():
 
 
 def test_audio_stream_stays_responsive_under_blocking_next():
-    # Assert the pre-fix `for chunk in audio_input_generate()` pattern blocks the
-    # event loop, then confirm the post-fix pattern exits promptly.
     cancel_event = threading.Event()
 
     def _audio_gen():
@@ -929,31 +938,29 @@ def test_audio_stream_stays_responsive_under_blocking_next():
     async def _run(loop_coro):
         return await asyncio.gather(loop_coro, _fire_early())
 
+    # The blocking loop never lets _fire_early run, so it drains all chunks before the cancel.
     cancel_event.clear()
     t0 = time.monotonic()
     prefix_seen, _ = asyncio.run(_run(_prefix_loop()))
     prefix_elapsed = time.monotonic() - t0
-    assert prefix_elapsed >= 0.13, (
-        f"pre-fix pattern should block event loop for >=1 chunk time "
-        f"(~150ms); got {prefix_elapsed:.3f}s, {len(prefix_seen)} chunks"
+    assert len(prefix_seen) == 8, (
+        "pre-fix pattern let the cancel through, so it is no longer modelling a blocked "
+        f"event loop; got {len(prefix_seen)} chunks"
     )
 
     cancel_event.clear()
-    t0 = time.monotonic()
     postfix_seen, _ = asyncio.run(_run(_postfix_loop()))
-    postfix_elapsed = time.monotonic() - t0
-    assert postfix_elapsed < prefix_elapsed, (
-        f"post-fix pattern must exit faster than pre-fix (blocking) "
-        f"pattern; post={postfix_elapsed:.3f}s vs pre={prefix_elapsed:.3f}s"
-    )
     assert (
         len(postfix_seen) < 8
     ), f"post-fix loop must not drain all chunks; got {len(postfix_seen)}"
+    assert len(postfix_seen) < len(prefix_seen), (
+        f"post-fix pattern saw as much as the blocking one: post={len(postfix_seen)} "
+        f"vs pre={len(prefix_seen)}"
+    )
+    assert prefix_elapsed < 30.0, f"the blocking loop never returned: {prefix_elapsed:.3f}s"
 
 
 def test_unsloth_stream_loop_emits_zero_tokens_on_preset_cancel():
-    # Pending-cancel replay: cancel_event pre-set, so the top-of-loop check must
-    # short-circuit iteration 1 (zero tokens). Catches moving the check below next().
     cancel_event = threading.Event()
     cancel_event.set()
     reset_calls = [0]
@@ -1001,8 +1008,6 @@ def test_unsloth_stream_loop_emits_zero_tokens_on_preset_cancel():
 
 
 def test_audio_stream_emits_zero_chunks_on_preset_cancel():
-    # Symmetric to the Unsloth pre-set test: the audio loop must skip
-    # asyncio.to_thread(next, ...) when cancel_event was pre-set via pending-replay.
     cancel_event = threading.Event()
     cancel_event.set()
 
